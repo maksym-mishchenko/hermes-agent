@@ -412,7 +412,11 @@ def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None
         base_time = now
         if last_run_at:
             base_time = _ensure_aware(datetime.fromisoformat(last_run_at))
-        cron = croniter(schedule["expr"], base_time)
+        # Accept "expr" (canonical) or legacy "cron" key (migration alias).
+        cron_expr = schedule.get("expr") or schedule.get("cron")
+        if not cron_expr:
+            return None
+        cron = croniter(cron_expr, base_time)
         next_run = cron.get_next(datetime)
         return next_run.isoformat()
 
@@ -1081,8 +1085,14 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
             # For recurring jobs, check if the scheduled time is stale
             # (gateway was down and missed the window). Fast-forward to
             # the next future occurrence instead of firing a stale run.
+            # Never-fired jobs must still run on first pickup even when their
+            # next_run_at is older than the grace window.
             grace = _compute_grace_seconds(schedule)
-            if kind in {"cron", "interval"} and (now - next_run_dt).total_seconds() > grace:
+            if (
+                kind in {"cron", "interval"}
+                and job.get("last_run_at") is not None
+                and (now - next_run_dt).total_seconds() > grace
+            ):
                 # Job is past its catch-up grace window — this is a stale missed run.
                 # Grace scales with schedule period: daily=2h, hourly=30m, 10min=5m.
                 new_next = compute_next_run(schedule, now.isoformat())
