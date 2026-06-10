@@ -169,6 +169,14 @@ class TestComputeNextRun:
         assert isinstance(next_dt, datetime)
         assert next_dt > datetime.now().astimezone()
 
+    def test_legacy_cron_key_returns_future(self):
+        pytest.importorskip("croniter")
+        schedule = {"kind": "cron", "cron": "* * * * *"}
+        result = compute_next_run(schedule)
+        assert isinstance(result, str)
+        next_dt = datetime.fromisoformat(result)
+        assert next_dt > datetime.now().astimezone()
+
     def test_unknown_kind_returns_none(self):
         assert compute_next_run({"kind": "unknown"}) is None
 
@@ -694,6 +702,7 @@ class TestGetDueJobs:
         # Force next_run_at to 35 minutes ago (beyond the 30-min grace for hourly)
         jobs = load_jobs()
         jobs[0]["next_run_at"] = (datetime.now() - timedelta(minutes=35)).isoformat()
+        jobs[0]["last_run_at"] = (datetime.now() - timedelta(hours=2)).isoformat()
         save_jobs(jobs)
 
         due = get_due_jobs()
@@ -703,6 +712,18 @@ class TestGetDueJobs:
         from cron.jobs import _ensure_aware, _hermes_now
         next_dt = _ensure_aware(datetime.fromisoformat(updated["next_run_at"]))
         assert next_dt > _hermes_now()
+
+    def test_never_run_stale_recurring_job_runs_once(self, tmp_cron_dir):
+        """Never-fired recurring jobs should run on first pickup even when stale."""
+        job = create_job(prompt="First pickup", schedule="every 1h")
+        jobs = load_jobs()
+        jobs[0]["next_run_at"] = (datetime.now() - timedelta(hours=3)).isoformat()
+        jobs[0]["last_run_at"] = None
+        save_jobs(jobs)
+
+        due = get_due_jobs()
+
+        assert [item["id"] for item in due] == [job["id"]]
 
     def test_future_not_returned(self, tmp_cron_dir):
         create_job(prompt="Not yet", schedule="every 1h")
