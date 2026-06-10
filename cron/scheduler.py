@@ -680,13 +680,15 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
     # Optionally wrap the content with a header/footer so the user knows this
     # is a cron delivery.  Wrapping is on by default; set cron.wrap_response: false
-    # in config.yaml for clean output.
+    # in config.yaml for clean output, or set wrap_response: false on a job.
     wrap_response = True
     try:
         user_cfg = load_config()
         wrap_response = user_cfg.get("cron", {}).get("wrap_response", True)
     except Exception:
         pass
+    if "wrap_response" in job:
+        wrap_response = bool(job["wrap_response"])
 
     if wrap_response:
         task_name = job.get("name", job["id"])
