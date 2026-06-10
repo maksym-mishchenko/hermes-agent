@@ -588,3 +588,63 @@ class TestTelegramApprovalCallback:
         query.answer.assert_called_once()
         query.edit_message_text.assert_called_once()
         assert (tmp_path / ".update_response").read_text() == "n"
+
+
+class TestTelegramFitnessCallbacks:
+    """OpenClaw-local fitness callback routing."""
+
+    def _make_query(self, data: str, user_id: int = 111):
+        query = AsyncMock()
+        query.data = data
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.message.chat.type = "private"
+        query.from_user = MagicMock()
+        query.from_user.id = user_id
+        query.from_user.first_name = "Maksym"
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+        update = MagicMock()
+        update.callback_query = query
+        return query, update, MagicMock()
+
+    @pytest.mark.asyncio
+    async def test_water_callback_logs_for_authorized_user(self):
+        adapter = _make_adapter()
+        query, update, context = self._make_query("water:500")
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "111"}), \
+             patch.object(adapter, "_post_fitness_json", new=AsyncMock(return_value={"total_ml": 750})) as post_mock:
+            await adapter._handle_callback_query(update, context)
+
+        post_mock.assert_awaited_once_with("/fitness/water", {"amount_ml": 500})
+        query.answer.assert_called_once()
+        query.edit_message_text.assert_awaited_once()
+        assert "Water +500ml" in query.edit_message_text.call_args.kwargs["text"]
+
+    @pytest.mark.asyncio
+    async def test_fitness_callback_rejects_unauthorized_user(self):
+        adapter = _make_adapter()
+        query, update, context = self._make_query("water:500", user_id=222)
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "111"}), \
+             patch.object(adapter, "_post_fitness_json", new=AsyncMock()) as post_mock:
+            await adapter._handle_callback_query(update, context)
+
+        post_mock.assert_not_called()
+        query.answer.assert_called_once()
+        assert "not authorized" in query.answer.call_args.kwargs["text"].lower()
+        query.edit_message_text.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_invalid_fitness_payload_does_not_call_api(self):
+        adapter = _make_adapter()
+        query, update, context = self._make_query("water:9999")
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "111"}), \
+             patch.object(adapter, "_post_fitness_json", new=AsyncMock()) as post_mock:
+            await adapter._handle_callback_query(update, context)
+
+        post_mock.assert_not_called()
+        query.edit_message_text.assert_awaited_once()
+        assert "Invalid water amount" in query.edit_message_text.call_args.kwargs["text"]

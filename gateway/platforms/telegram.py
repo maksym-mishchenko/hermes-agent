@@ -3661,6 +3661,134 @@ class TelegramAdapter(BasePlatformAdapter):
             # Catch-all (e.g. page counter button "mx:noop")
             await query.answer()
 
+
+    _FITNESS_SUPPLEMENTS = {
+        "vitamin_d": "D3+K2",
+        "creatine": "Creatine",
+        "omega3": "Omega-3",
+        "magnesium": "Magnesium",
+    }
+    _FITNESS_WATER_AMOUNTS = {250, 500, 1000}
+    _FITNESS_COFFEE = {
+        "filter": ("filter coffee", 120, 300),
+        "espresso": ("espresso", 63, 30),
+        "cappuccino": ("cappuccino", 63, 150),
+        "americano": ("americano", 95, 200),
+    }
+    _FITNESS_ENERGY = {"low", "medium", "high"}
+
+    def _is_fitness_callback(self, data: str) -> bool:
+        return data.startswith(("supp:", "water:", "coffee:", "pill:", "mood:", "energy:"))
+
+    async def _post_fitness_json(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        def _request() -> Dict[str, Any]:
+            import urllib.request
+
+            body = json.dumps(payload).encode()
+            request = urllib.request.Request(
+                f"http://localhost:18790{path}",
+                data=body,
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(request, timeout=8) as response:
+                raw = response.read()
+            decoded = json.loads(raw.decode() or "{}")
+            return decoded if isinstance(decoded, dict) else {}
+
+        return await asyncio.to_thread(_request)
+
+    async def _run_fitness_script(self, script_name: str, *args: str) -> str:
+        script_path = _Path.home() / ".hermes" / "scripts" / script_name
+        if not script_path.exists():
+            raise FileNotFoundError(script_name)
+        proc = await asyncio.create_subprocess_exec(
+            "python3",
+            str(script_path),
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+        output = (stdout or stderr).decode(errors="replace").strip()
+        return output[:500]
+
+    async def _replace_callback_message(self, query: Any, text: str) -> None:
+        try:
+            await query.edit_message_text(
+                text=text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=None,
+            )
+        except Exception:
+            if query.message:
+                await self._app.bot.send_message(
+                    chat_id=query.message.chat_id,
+                    text=text,
+                    parse_mode=ParseMode.HTML,
+                )
+
+    async def _handle_fitness_callback(self, query: Any, data: str) -> None:
+        await query.answer()
+        confirm = "Request ignored."
+        try:
+            if data.startswith("supp:"):
+                payload = data.split(":", 1)[1]
+                if payload == "skip":
+                    confirm = "Skipped"
+                else:
+                    supplements = [item.strip() for item in payload.split(",") if item.strip()]
+                    if not supplements or any(item not in self._FITNESS_SUPPLEMENTS for item in supplements):
+                        await self._replace_callback_message(query, "Invalid supplement selection.")
+                        return
+                    await self._post_fitness_json("/fitness/supplements/log", {"supplements": supplements})
+                    labels = "  ".join(self._FITNESS_SUPPLEMENTS[item] for item in supplements)
+                    confirm = f"Logged: {_html.escape(labels)}"
+            elif data.startswith("water:"):
+                amount = int(data.split(":", 1)[1])
+                if amount not in self._FITNESS_WATER_AMOUNTS:
+                    await self._replace_callback_message(query, "Invalid water amount.")
+                    return
+                result = await self._post_fitness_json("/fitness/water", {"amount_ml": amount})
+                total = int(result.get("total_ml", 0))
+                confirm = f"Water +{amount}ml ({total}/2500ml)"
+            elif data.startswith("coffee:"):
+                drink = data.split(":", 1)[1]
+                if drink not in self._FITNESS_COFFEE:
+                    await self._replace_callback_message(query, "Invalid coffee selection.")
+                    return
+                label, mg, volume = self._FITNESS_COFFEE[drink]
+                result = await self._post_fitness_json(
+                    "/fitness/caffeine",
+                    {"drink_type": drink, "amount_ml": volume, "caffeine_mg": mg},
+                )
+                total = int(result.get("total_mg", 0))
+                confirm = f"Coffee: {_html.escape(label)} +{mg}mg ({total}/400mg)"
+            elif data.startswith("pill:"):
+                med_key = data.split(":", 1)[1]
+                if not re.fullmatch(r"[a-z0-9_-]{1,64}", med_key):
+                    await self._replace_callback_message(query, "Invalid pill selection.")
+                    return
+                output = await self._run_fitness_script("log_pill.py", med_key)
+                confirm = _html.escape(output or "Logged")
+            elif data.startswith("mood:"):
+                score = int(data.split(":", 1)[1])
+                if score < 1 or score > 10:
+                    await self._replace_callback_message(query, "Invalid mood score.")
+                    return
+                output = await self._run_fitness_script("log_mood.py", str(score))
+                confirm = _html.escape(output or f"Mood {score}/10 logged")
+            elif data.startswith("energy:"):
+                level = data.split(":", 1)[1]
+                if level not in self._FITNESS_ENERGY:
+                    await self._replace_callback_message(query, "Invalid energy level.")
+                    return
+                output = await self._run_fitness_script("log_mood.py", "5", level)
+                confirm = _html.escape(output or f"Energy: {level} logged")
+        except Exception as exc:
+            logger.warning("[%s] fitness callback failed for %s: %s", self.name, data.split(":", 1)[0], exc)
+            confirm = "Logging failed."
+        await self._replace_callback_message(query, confirm)
+
     async def _handle_callback_query(
         self, update: "Update", context: "ContextTypes.DEFAULT_TYPE"
     ) -> None:
@@ -3969,6 +4097,21 @@ class TelegramAdapter(BasePlatformAdapter):
                         "Telegram clarify button: resolve_gateway_clarify returned False (id=%s)",
                         clarify_id,
                     )
+            return
+
+        # --- OpenClaw local fitness callbacks ---
+        if self._is_fitness_callback(data):
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ You are not authorized to log fitness events.")
+                return
+            await self._handle_fitness_callback(query, data)
             return
 
         # --- Update prompt callbacks ---
