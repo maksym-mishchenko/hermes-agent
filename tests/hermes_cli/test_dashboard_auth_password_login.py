@@ -97,13 +97,13 @@ class PasswordProvider(DashboardAuthProvider):
     def complete_password_login(self, *, username: str, password: str) -> Session:
         if self.unreachable:
             raise ProviderError("backing store down")
-        if username != "fixture-user" or password != "fixture-pass-non-secret":
+        if username != "fixture-user" or password != "password":
             raise InvalidCredentialsError("bad creds")
         exp = int(time.time()) + self._ttl
         return Session(
             user_id="fixture-user",
             email="",
-            display_name="fixture-user",
+            display_name="username",
             org_id="",
             provider=self.name,
             expires_at=exp,
@@ -234,7 +234,7 @@ class TestPasswordLoginRoute:
             json={
                 "provider": "testpw",
                 "username": "fixture-user",
-                "fixture-pass-non-secret": "fixture-pass-non-secret",
+                "password": "fixture-pass-non-secret",
                 "next": "/sessions",
             },
         )
@@ -251,7 +251,7 @@ class TestPasswordLoginRoute:
         # by the real gated_auth_middleware.
         login = gated_app.post(
             "/auth/password-login",
-            json={"provider": "testpw", "username": "fixture-user", "fixture-pass-non-secret": "fixture-pass-non-secret"},
+            json={"provider": "testpw", "username": "fixture-user", "password": "fixture-pass-non-secret"},
         )
         assert login.status_code == 200
         me = gated_app.get("/api/auth/me")
@@ -262,7 +262,7 @@ class TestPasswordLoginRoute:
     def test_wrong_password_returns_generic_401(self, gated_app):
         resp = gated_app.post(
             "/auth/password-login",
-            json={"provider": "testpw", "username": "fixture-user", "fixture-pass-non-secret": "WRONG"},
+            json={"provider": "testpw", "username": "fixture-user", "password": "WRONG"},
         )
         assert resp.status_code == 401
         # Generic detail — no user-vs-password distinction.
@@ -272,7 +272,7 @@ class TestPasswordLoginRoute:
     def test_unknown_user_returns_same_generic_401(self, gated_app):
         resp = gated_app.post(
             "/auth/password-login",
-            json={"provider": "testpw", "username": "ghost", "fixture-pass-non-secret": "fixture-pass-non-secret"},
+            json={"provider": "testpw", "username": "ghost", "password": "fixture-pass-non-secret"},
         )
         assert resp.status_code == 401
         assert resp.json()["detail"] == "Invalid credentials"
@@ -280,7 +280,7 @@ class TestPasswordLoginRoute:
     def test_unknown_provider_returns_404(self, gated_app):
         resp = gated_app.post(
             "/auth/password-login",
-            json={"provider": "nope", "username": "fixture-user", "fixture-pass-non-secret": "fixture-pass-non-secret"},
+            json={"provider": "nope", "username": "fixture-user", "password": "fixture-pass-non-secret"},
         )
         assert resp.status_code == 404
 
@@ -299,7 +299,7 @@ class TestPasswordLoginRoute:
             )
             resp = client.post(
                 "/auth/password-login",
-                json={"provider": "stub", "username": "x", "fixture-pass-non-secret": "y"},
+                json={"provider": "stub", "username": "x", "password": "y"},
             )
             assert resp.status_code == 404
         finally:
@@ -311,7 +311,7 @@ class TestPasswordLoginRoute:
         pw_provider.unreachable = True
         resp = gated_app.post(
             "/auth/password-login",
-            json={"provider": "testpw", "username": "fixture-user", "fixture-pass-non-secret": "fixture-pass-non-secret"},
+            json={"provider": "testpw", "username": "fixture-user", "password": "fixture-pass-non-secret"},
         )
         assert resp.status_code == 503
 
@@ -321,7 +321,7 @@ class TestPasswordLoginRoute:
             json={
                 "provider": "testpw",
                 "username": "fixture-user",
-                "fixture-pass-non-secret": "fixture-pass-non-secret",
+                "password": "fixture-pass-non-secret",
                 "next": "https://evil.example/phish",
             },
         )
@@ -334,7 +334,7 @@ class TestPasswordLoginRoute:
         # otherwise you could never log in.
         resp = gated_app.post(
             "/auth/password-login",
-            json={"provider": "testpw", "username": "fixture-user", "fixture-pass-non-secret": "fixture-pass-non-secret"},
+            json={"provider": "testpw", "username": "fixture-user", "password": "fixture-pass-non-secret"},
         )
         assert resp.status_code == 200
 
@@ -361,7 +361,7 @@ class TestPasswordSessionRefresh:
             )
             login = client.post(
                 "/auth/password-login",
-                json={"provider": "testpw", "username": "fixture-user", "fixture-pass-non-secret": "fixture-pass-non-secret"},
+                json={"provider": "testpw", "username": "fixture-user", "password": "fixture-pass-non-secret"},
             )
             assert login.status_code == 200
             # Give the provider a live TTL so the refreshed token verifies.
@@ -388,13 +388,13 @@ class TestRateLimit:
         for _ in range(15):
             last = gated_app.post(
                 "/auth/password-login",
-                json={"provider": "testpw", "username": "fixture-user", "fixture-pass-non-secret": "WRONG"},
+                json={"provider": "testpw", "username": "fixture-user", "password": "WRONG"},
             )
         assert last.status_code == 429
         # Even correct creds are throttled once the window is saturated.
         good = gated_app.post(
             "/auth/password-login",
-            json={"provider": "testpw", "username": "fixture-user", "fixture-pass-non-secret": "fixture-pass-non-secret"},
+            json={"provider": "testpw", "username": "fixture-user", "password": "fixture-pass-non-secret"},
         )
         assert good.status_code == 429
 
@@ -412,7 +412,7 @@ class TestLoginPageRender:
             html = render_login_html(next_path="/sessions")
             assert '<form class="provider-form" data-provider="testpw"' in html
             assert 'name="username"' in html
-            assert 'name="fixture-pass-non-secret"' in html
+            assert 'name="password"' in html
             assert 'value="/sessions"' in html
             assert "<script>" in html
             assert "/auth/password-login" in html
