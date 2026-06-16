@@ -71,7 +71,7 @@ class TestProvider:
     def _make(self, basic, **kw):
         h = basic.hash_password("fixture-pass-non-secret")
         return basic.BasicAuthProvider(
-            username="fixture-user",
+            username="username",
             password_hash=h,
             secret=secrets.token_bytes(32),
             **kw,
@@ -85,7 +85,7 @@ class TestProvider:
 
     def test_login_mints_session(self, basic):
         p = self._make(basic)
-        s = p.complete_password_login(username="fixture-user", password="fixture-pass-non-secret")
+        s = p.complete_password_login(username="username", password="fixture-pass-non-secret")
         assert s.user_id == "fixture-user"
         assert s.provider == "basic"
         assert s.access_token and s.refresh_token
@@ -98,13 +98,13 @@ class TestProvider:
 
     def test_verify_round_trips_and_rejects_tamper(self, basic):
         p = self._make(basic)
-        s = p.complete_password_login(username="fixture-user", password="fixture-pass-non-secret")
+        s = p.complete_password_login(username="username", password="fixture-pass-non-secret")
         assert p.verify_session(access_token=s.access_token) is not None
         assert p.verify_session(access_token="garbage") is None
 
     def test_access_token_not_accepted_as_refresh(self, basic):
         p = self._make(basic)
-        s = p.complete_password_login(username="fixture-user", password="fixture-pass-non-secret")
+        s = p.complete_password_login(username="username", password="fixture-pass-non-secret")
         # A refresh token must not verify as an access token and vice
         # versa — the ``kind`` claim is enforced.
         assert p.verify_session(access_token=s.refresh_token) is None
@@ -113,7 +113,7 @@ class TestProvider:
 
     def test_refresh_round_trips(self, basic):
         p = self._make(basic)
-        s = p.complete_password_login(username="fixture-user", password="fixture-pass-non-secret")
+        s = p.complete_password_login(username="username", password="fixture-pass-non-secret")
         r = p.refresh_session(refresh_token=s.refresh_token)
         assert r.user_id == "fixture-user"
         assert p.verify_session(access_token=r.access_token) is not None
@@ -126,7 +126,7 @@ class TestProvider:
     def test_cross_secret_token_does_not_verify(self, basic):
         p1 = self._make(basic)
         p2 = self._make(basic)  # different random secret
-        s = p1.complete_password_login(username="fixture-user", password="fixture-pass-non-secret")
+        s = p1.complete_password_login(username="username", password="fixture-pass-non-secret")
         assert p2.verify_session(access_token=s.access_token) is None
 
     def test_revoke_is_silent(self, basic):
@@ -150,11 +150,11 @@ class TestProvider:
             )
         with pytest.raises(ValueError):
             basic.BasicAuthProvider(
-                username="fixture-user", password_hash="", secret=b"x" * 32
+                username="username", password_hash="", secret=b"x" * 32
             )
         with pytest.raises(ValueError):
             basic.BasicAuthProvider(
-                username="fixture-user", password_hash=good_hash, secret=b"short"
+                username="username", password_hash=good_hash, secret=b"short"
             )
 
 
@@ -189,7 +189,7 @@ class TestRegister:
         provider = ctx.register_dashboard_auth_provider.call_args.args[0]
         assert isinstance(provider, basic.BasicAuthProvider)
         # Round-trips: the registered provider authenticates the env creds.
-        s = provider.complete_password_login(username="fixture-user", password="fixture-pass-non-secret")
+        s = provider.complete_password_login(username="username", password="fixture-pass-non-secret")
         assert s.user_id == "fixture-user"
         assert basic.LAST_SKIP_REASON == ""
 
@@ -222,11 +222,11 @@ class TestRegister:
         provider = ctx.register_dashboard_auth_provider.call_args.args[0]
         # env password works ...
         assert provider.complete_password_login(
-            username="fixture-user", password="env-pw"
+            username="username", password="env-pw"
         )
         # ... and the config password no longer does.
         with pytest.raises(InvalidCredentialsError):
-            provider.complete_password_login(username="fixture-user", password="config-pw")
+            provider.complete_password_login(username="username", password="config-pw")
 
     def test_explicit_secret_makes_sessions_portable(self, basic, monkeypatch):
         # Two providers built from the SAME explicit secret accept each
@@ -242,5 +242,5 @@ class TestRegister:
         basic.register(ctx2)
         p1 = ctx1.register_dashboard_auth_provider.call_args.args[0]
         p2 = ctx2.register_dashboard_auth_provider.call_args.args[0]
-        s = p1.complete_password_login(username="fixture-user", password="fixture-pass-non-secret")
+        s = p1.complete_password_login(username="username", password="fixture-pass-non-secret")
         assert p2.verify_session(access_token=s.access_token) is not None
