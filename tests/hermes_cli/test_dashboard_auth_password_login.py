@@ -97,7 +97,7 @@ class PasswordProvider(DashboardAuthProvider):
     def complete_password_login(self, *, username: str, password: str) -> Session:
         if self.unreachable:
             raise ProviderError("backing store down")
-        if username != "fixture-user" or password != "password":
+        if username != "fixture-user" or password != "fixture-pass-non-secret":
             raise InvalidCredentialsError("bad creds")
         exp = int(time.time()) + self._ttl
         return Session(
