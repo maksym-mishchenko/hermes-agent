@@ -1,0 +1,13 @@
+# Extends the built-in gitleaks ruleset. Keep allowlist conservative
+# (paths only) so real secrets are never masked.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Safe placeholders and test fixtures"
+paths = [
+  '''\.example$''',
+  '''\.sample$''',
+  '''(^|/)fixtures?/''',
+  '''(^|/)testdata/''',
+]
