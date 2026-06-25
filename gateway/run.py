@@ -8427,6 +8427,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 run_generation=run_generation,
                 event_message_id=self._reply_anchor_for_event(event),
                 channel_prompt=event.channel_prompt,
+                event=event,
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -12843,6 +12844,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
+        event: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -15231,6 +15233,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
+                    event=pending_event,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
