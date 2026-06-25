@@ -145,6 +145,10 @@ VALID_HOOKS: Set[str] = {
     "on_session_reset",
     "subagent_start",
     "subagent_stop",
+    "gateway_agent_run_start",
+    "gateway_agent_run_finish",
+    "cron_job_start",
+    "cron_job_finish",
     # Gateway pre-dispatch hook. Fired once per incoming MessageEvent
     # after the internal-event guard but BEFORE auth/pairing and agent
     # dispatch. Plugins may return a dict to influence flow:

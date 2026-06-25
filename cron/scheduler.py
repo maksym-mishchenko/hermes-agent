@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from contextlib import contextmanager
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
@@ -44,6 +45,15 @@ from hermes_cli.config import load_config, _expand_env_vars
 from hermes_time import now as _hermes_now
 
 logger = logging.getLogger(__name__)
+
+
+def _invoke_observer_hook(hook_name: str, **kwargs) -> None:
+    try:
+        from hermes_cli.plugins import has_hook, invoke_hook
+        if has_hook(hook_name):
+            invoke_hook(hook_name, **kwargs)
+    except Exception:
+        logger.debug("%s hook invocation failed", hook_name, exc_info=True)
 
 
 class CronPromptInjectionBlocked(Exception):
@@ -1383,8 +1393,48 @@ def _scan_assembled_cron_prompt(
 def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     """Execute a single cron job, applying any per-job profile override."""
     job_id = job["id"]
-    with _job_profile_context(job_id, job.get("profile")):
-        return _run_job_impl(job)
+    job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
+    telemetry_task_id = f"cron:{job_id}:{int(time.time() * 1000)}"
+    started_at = time.monotonic()
+    _invoke_observer_hook(
+        "cron_job_start",
+        task_id=telemetry_task_id,
+        job_id=str(job_id),
+        job_name=job_name,
+        schedule=str(job.get("schedule_display") or job.get("schedule") or ""),
+        no_agent=bool(job.get("no_agent")),
+        profile=str(job.get("profile") or ""),
+        workdir_set=bool((job.get("workdir") or "").strip()),
+    )
+    try:
+        with _job_profile_context(job_id, job.get("profile")):
+            result = _run_job_impl(job)
+    except Exception as exc:
+        _invoke_observer_hook(
+            "cron_job_finish",
+            task_id=telemetry_task_id,
+            job_id=str(job_id),
+            job_name=job_name,
+            status="error",
+            duration_ms=int((time.monotonic() - started_at) * 1000),
+            error_type=type(exc).__name__,
+        )
+        raise
+    success, _output, final_response, error = result
+    status = "ok" if success else "error"
+    if success and final_response == SILENT_MARKER:
+        status = "silent"
+    _invoke_observer_hook(
+        "cron_job_finish",
+        task_id=telemetry_task_id,
+        job_id=str(job_id),
+        job_name=job_name,
+        status=status,
+        duration_ms=int((time.monotonic() - started_at) * 1000),
+        error_type="" if success else "cron_job_error",
+        delivery_error="",
+    )
+    return result
 
 
 def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
