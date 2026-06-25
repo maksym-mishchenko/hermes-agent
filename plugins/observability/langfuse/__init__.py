@@ -23,6 +23,7 @@ Optional env vars:
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 import re
@@ -45,8 +46,10 @@ class TraceState:
     trace_id: str
     root_ctx: Any
     root_span: Any
+    root_component: str = "agent_turn"
     generations: Dict[str, Any] = field(default_factory=dict)
     tools: Dict[str, Any] = field(default_factory=dict)
+    subagents: Dict[str, Any] = field(default_factory=dict)
     pending_tools_by_name: Dict[str, list] = field(default_factory=dict)
     turn_tool_calls: list[dict[str, Any]] = field(default_factory=list)
     last_updated_at: float = field(default_factory=time.time)
@@ -69,6 +72,38 @@ _LANGFUSE_KEY_PREFIXES: Dict[str, str] = {
     "HERMES_LANGFUSE_PUBLIC_KEY": "pk-lf-",
     "HERMES_LANGFUSE_SECRET_KEY": "sk-lf-",
 }
+_SECRET_VALUE_PATTERNS = (
+    re.compile(r"\bsk-[A-Za-z0-9][A-Za-z0-9_\-]{12,}\b"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"),
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9\-]{20,}\b"),
+    re.compile(r"\bhf_[A-Za-z0-9]{20,}\b"),
+    re.compile(r"\bglpat-[A-Za-z0-9_\-]{20,}\b"),
+    re.compile(r"(?i)\b(Bearer\s+)[A-Za-z0-9._\-]{20,}\b"),
+)
+_SENSITIVE_KEY_PARTS = (
+    "api_key",
+    "apikey",
+    "authorization",
+    "cookie",
+    "password",
+    "private_key",
+    "secret",
+    "token",
+    "webhook_secret",
+)
+_CONTENT_KEY_PARTS = (
+    "argument",
+    "content",
+    "input",
+    "message",
+    "output",
+    "prompt",
+    "reasoning",
+    "response",
+    "summary",
+    "text",
+    "transcript",
+)
 
 
 def _env(name: str, default: str = "") -> str:
@@ -83,6 +118,13 @@ def _env_bool(*names: str) -> bool:
     return False
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(_env(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
 def _debug_enabled() -> bool:
     return _env_bool("HERMES_LANGFUSE_DEBUG")
 
@@ -90,6 +132,48 @@ def _debug_enabled() -> bool:
 def _debug(message: str) -> None:
     if _debug_enabled():
         logger.info("Langfuse tracing: %s", message)
+
+
+def _capture_content_enabled() -> bool:
+    return _env_bool(
+        "HERMES_LANGFUSE_CAPTURE_CONTENT",
+        "HERMES_LANGFUSE_INCLUDE_CONTENT",
+    )
+
+
+def _hash_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _summarize_text(value: str) -> dict[str, Any]:
+    stripped = value.strip()
+    return {
+        "type": "text",
+        "chars": len(value),
+        "lines": value.count("\n") + (1 if value else 0),
+        "sha256": _hash_text(value),
+        "empty": not bool(stripped),
+    }
+
+
+def _is_sensitive_key(key: Any) -> bool:
+    lowered = str(key or "").lower().replace("-", "_")
+    return any(part in lowered for part in _SENSITIVE_KEY_PARTS)
+
+
+def _is_content_key(key: Any) -> bool:
+    lowered = str(key or "").lower().replace("-", "_")
+    return any(part in lowered for part in _CONTENT_KEY_PARTS)
+
+
+def _redact_secret_patterns(value: str) -> str:
+    redacted = value
+    for pattern in _SECRET_VALUE_PATTERNS:
+        redacted = pattern.sub(
+            lambda m: (m.group(1) if m.lastindex else "") + "[REDACTED]",
+            redacted,
+        )
+    return redacted
 
 
 # Sentinel: "_get_langfuse() has tried and failed". Lets us short-circuit
@@ -243,7 +327,7 @@ def _redact_data_uri(value: str) -> dict[str, Any]:
     }
 
 
-def _truncate_text(value: str, max_chars: int) -> Any:
+def _truncate_text(value: str, max_chars: int, *, capture_content: bool = True) -> Any:
     # Langfuse SDK treats data:*;base64 strings as media and attempts to
     # decode them. Truncating those strings produces invalid base64 and noisy
     # "Error parsing base64 data URI" logs. Observability only needs metadata,
@@ -251,6 +335,9 @@ def _truncate_text(value: str, max_chars: int) -> Any:
     # reaches the SDK.
     if _is_base64_data_uri(value):
         return _redact_data_uri(value)
+    value = _redact_secret_patterns(value)
+    if not capture_content:
+        return _summarize_text(value)
     if len(value) <= max_chars:
         return value
     return value[:max_chars] + f"... [truncated {len(value) - max_chars} chars]"
@@ -385,8 +472,11 @@ def _normalize_payload(value: Any, *, tool_name: str = "", args: Any = None) -> 
 
 
 def _safe_value(value: Any, *, max_chars: Optional[int] = None, depth: int = 0,
-                parse_json_strings: bool = False) -> Any:
+                parse_json_strings: bool = False,
+                capture_content: Optional[bool] = None) -> Any:
     max_chars = max_chars if max_chars is not None else int(_env("HERMES_LANGFUSE_MAX_CHARS", "12000") or "12000")
+    if capture_content is None:
+        capture_content = True
     if depth > 4:
         return "<max-depth>"
     if value is None or isinstance(value, (int, float, bool)):
@@ -397,24 +487,68 @@ def _safe_value(value: Any, *, max_chars: Optional[int] = None, depth: int = 0,
         if parse_json_strings:
             parsed = _maybe_parse_json_string(value)
             if parsed is not value:
-                return _safe_value(parsed, max_chars=max_chars, depth=depth, parse_json_strings=True)
-        return _truncate_text(value, max_chars)
+                return _safe_value(
+                    parsed,
+                    max_chars=max_chars,
+                    depth=depth,
+                    parse_json_strings=True,
+                    capture_content=capture_content,
+                )
+        return _truncate_text(value, max_chars, capture_content=capture_content)
     if isinstance(value, dict):
         normalized = _normalize_payload(value)
         if normalized is not value:
-            return _safe_value(normalized, max_chars=max_chars, depth=depth, parse_json_strings=parse_json_strings)
+            return _safe_value(
+                normalized,
+                max_chars=max_chars,
+                depth=depth,
+                parse_json_strings=parse_json_strings,
+                capture_content=capture_content,
+            )
         return {
-            str(k): _safe_value(v, max_chars=max_chars, depth=depth + 1, parse_json_strings=parse_json_strings)
+            str(k): (
+                "<redacted>"
+                if _is_sensitive_key(k)
+                else (
+                    _safe_value(
+                        v,
+                        max_chars=max_chars,
+                        depth=depth + 1,
+                        parse_json_strings=parse_json_strings,
+                        capture_content=True,
+                    )
+                    if not capture_content and not _is_content_key(k) and isinstance(v, str)
+                    else _safe_value(
+                        v,
+                        max_chars=max_chars,
+                        depth=depth + 1,
+                        parse_json_strings=parse_json_strings,
+                        capture_content=capture_content,
+                    )
+                )
+            )
             for k, v in list(value.items())[:50]
         }
     if isinstance(value, (list, tuple, set)):
         return [
-            _safe_value(v, max_chars=max_chars, depth=depth + 1, parse_json_strings=parse_json_strings)
+            _safe_value(
+                v,
+                max_chars=max_chars,
+                depth=depth + 1,
+                parse_json_strings=parse_json_strings,
+                capture_content=capture_content,
+            )
             for v in list(value)[:50]
         ]
     if hasattr(value, "__dict__"):
-        return _safe_value(vars(value), max_chars=max_chars, depth=depth + 1, parse_json_strings=parse_json_strings)
-    return _truncate_text(repr(value), max_chars)
+        return _safe_value(
+            vars(value),
+            max_chars=max_chars,
+            depth=depth + 1,
+            parse_json_strings=parse_json_strings,
+            capture_content=capture_content,
+        )
+    return _truncate_text(repr(value), max_chars, capture_content=capture_content)
 
 
 def _extract_last_user_message(messages: Any) -> Any:
@@ -424,7 +558,10 @@ def _extract_last_user_message(messages: Any) -> Any:
         if isinstance(message, dict) and message.get("role") == "user":
             return {
                 "role": "user",
-                "content": _safe_value(message.get("content")),
+                "content": _safe_value(
+                    message.get("content"),
+                    capture_content=_capture_content_enabled(),
+                ),
             }
     return None
 
@@ -457,15 +594,20 @@ def _serialize_messages(messages: Any) -> list[dict[str, Any]]:
             "content": _safe_value(
                 message.get("content"),
                 parse_json_strings=(role == "tool"),
+                capture_content=_capture_content_enabled(),
             ),
         }
         if role == "tool":
             if message.get("tool_call_id"):
                 item["tool_call_id"] = message.get("tool_call_id")
             if message.get("name"):
-                item["name"] = _safe_value(message.get("name"))
+                item["name"] = _safe_value(message.get("name"), capture_content=True)
         if message.get("tool_calls"):
-            item["tool_calls"] = _safe_value(message.get("tool_calls"), parse_json_strings=True)
+            item["tool_calls"] = _safe_value(
+                message.get("tool_calls"),
+                parse_json_strings=True,
+                capture_content=_capture_content_enabled(),
+            )
         serialized.append(item)
     return serialized
 
@@ -478,7 +620,11 @@ def _serialize_tool_calls(tool_calls: Any) -> list[dict[str, Any]]:
         fn = getattr(tool_call, "function", None)
         name = getattr(fn, "name", None) if fn else None
         arguments = getattr(fn, "arguments", None) if fn else None
-        safe_arguments = _safe_value(arguments, parse_json_strings=False)
+        safe_arguments = _safe_value(
+            arguments,
+            parse_json_strings=False,
+            capture_content=_capture_content_enabled(),
+        )
         serialized.append({
             "id": getattr(tool_call, "id", None),
             "type": getattr(tool_call, "type", None) or "function",
@@ -494,10 +640,31 @@ def _serialize_tool_calls(tool_calls: Any) -> list[dict[str, Any]]:
 
 def _serialize_assistant_message(message: Any) -> dict[str, Any]:
     return {
-        "content": _safe_value(getattr(message, "content", None)),
-        "reasoning": _safe_value(getattr(message, "reasoning", None)),
+        "content": _safe_value(
+            getattr(message, "content", None),
+            capture_content=_capture_content_enabled(),
+        ),
+        "reasoning": _safe_value(
+            getattr(message, "reasoning", None),
+            capture_content=False,
+        ),
         "tool_calls": _serialize_tool_calls(getattr(message, "tool_calls", None)),
     }
+
+
+def _base_metadata(component: str, **fields: Any) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "service": _env("HERMES_LANGFUSE_SERVICE", "hermes-agent") or "hermes-agent",
+        "source": "hermes",
+        "component": component,
+    }
+    environment = _env("HERMES_LANGFUSE_ENV") or _env("LANGFUSE_ENV")
+    if environment:
+        metadata["environment"] = environment
+    for key, value in fields.items():
+        if value not in (None, ""):
+            metadata[key] = _safe_value(value, capture_content=False)
+    return metadata
 
 
 def _usage_and_cost(response: Any, *, provider: str, api_mode: str, model: str, base_url: str) -> tuple[dict[str, int], dict[str, float]]:
@@ -562,18 +729,33 @@ def _usage_and_cost(response: Any, *, provider: str, api_mode: str, model: str, 
     return usage_details, cost_details
 
 
-def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform: str, provider: str, model: str,
-                      api_mode: str, messages: Any, client: Langfuse) -> TraceState:
+def _start_root_trace(
+    task_key: str,
+    *,
+    task_id: str,
+    session_id: str,
+    platform: str,
+    provider: str,
+    model: str,
+    api_mode: str,
+    messages: Any,
+    client: Langfuse,
+    trace_name: str = "Hermes turn",
+    component: str = "agent_turn",
+    input_value: Any = None,
+    metadata_extra: Optional[dict[str, Any]] = None,
+) -> TraceState:
     trace_id = client.create_trace_id(seed=f"{session_id or 'sessionless'}::{task_id or task_key}")
-    trace_input = _extract_last_user_message(messages)
-    metadata = {
-        "source": "hermes",
-        "task_id": task_id,
-        "platform": platform,
-        "provider": provider,
-        "model": model,
-        "api_mode": api_mode,
-    }
+    trace_input = input_value if input_value is not None else _extract_last_user_message(messages)
+    metadata = _base_metadata(
+        component,
+        task_id=task_id,
+        platform=platform,
+        provider=provider,
+        model=model,
+        api_mode=api_mode,
+        **(metadata_extra or {}),
+    )
 
     # session_id must be passed in trace_context for Langfuse session grouping.
     trace_ctx: Dict[str, Any] = {"trace_id": trace_id}
@@ -584,12 +766,12 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
         try:
             with propagate_attributes(
                 session_id=session_id or task_key,
-                trace_name="Hermes turn",
-                tags=["hermes", "langfuse"],
+                trace_name=trace_name,
+                tags=["hermes", "langfuse", component],
             ):
                 root_ctx = client.start_as_current_observation(
                     trace_context=trace_ctx,
-                    name="Hermes turn",
+                    name=trace_name,
                     as_type="chain",
                     input=trace_input,
                     metadata=metadata,
@@ -599,7 +781,7 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
         except Exception:
             root_ctx = client.start_as_current_observation(
                 trace_context=trace_ctx,
-                name="Hermes turn",
+                name=trace_name,
                 as_type="chain",
                 input=trace_input,
                 metadata=metadata,
@@ -609,7 +791,7 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
     else:
         root_ctx = client.start_as_current_observation(
             trace_context=trace_ctx,
-            name="Hermes turn",
+            name=trace_name,
             as_type="chain",
             input=trace_input,
             metadata=metadata,
@@ -623,7 +805,12 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
         pass
 
     _debug(f"started trace {trace_id} for {task_key}")
-    return TraceState(trace_id=trace_id, root_ctx=root_ctx, root_span=root_span)
+    return TraceState(
+        trace_id=trace_id,
+        root_ctx=root_ctx,
+        root_span=root_span,
+        root_component=component,
+    )
 
 
 def _start_child_observation(state: TraceState, *, client: Langfuse, name: str, as_type: str,
@@ -660,6 +847,23 @@ def _end_observation(observation: Any, *, output: Any = None, metadata: Optional
         _debug(f"end observation failed: {exc}")
 
 
+def _flush_client(client: Any) -> None:
+    timeout = max(0.1, _env_float("HERMES_LANGFUSE_FLUSH_TIMEOUT_SECONDS", 2.0))
+    done = threading.Event()
+
+    def _flush() -> None:
+        try:
+            client.flush()
+        except Exception:
+            pass
+        finally:
+            done.set()
+
+    thread = threading.Thread(target=_flush, daemon=True)
+    thread.start()
+    done.wait(timeout=timeout)
+
+
 def _merge_trace_output(output: Any, state: TraceState) -> Any:
     if not state.turn_tool_calls:
         return output
@@ -684,6 +888,8 @@ def _finish_trace(task_key: str, *, output: Any = None) -> None:
             _end_observation(observation)
         for observation in state.tools.values():
             _end_observation(observation)
+        for observation in state.subagents.values():
+            _end_observation(observation)
         for queue in state.pending_tools_by_name.values():
             for observation in queue:
                 _end_observation(observation)
@@ -696,7 +902,7 @@ def _finish_trace(task_key: str, *, output: Any = None) -> None:
         _debug(f"finish trace failed: {exc}")
     finally:
         try:
-            client.flush()
+            _flush_client(client)
         except Exception:
             pass
 
@@ -945,8 +1151,61 @@ def on_post_llm_call(*, task_id: str = "", session_id: str = "", provider: str =
 
     has_tools = _assistant_has_tool_calls(assistant_message) if assistant_message else (assistant_tool_call_count > 0)
     has_content = bool(output.get("content"))
-    if not has_tools and has_content:
+    if state.root_component == "agent_turn" and not has_tools and has_content:
         _finish_trace(task_key, output=output)
+
+
+def on_api_request_error(
+    *,
+    task_id: str = "",
+    session_id: str = "",
+    api_call_count: int = 0,
+    api_duration: float = 0.0,
+    status_code: Any = None,
+    retry_count: Any = None,
+    max_retries: Any = None,
+    retryable: Any = None,
+    reason: str = "",
+    error: Any = None,
+    model: str = "",
+    provider: str = "",
+    base_url: str = "",
+    api_mode: str = "",
+    **_: Any,
+) -> None:
+    if _get_langfuse() is None:
+        return
+    task_key = _trace_key(task_id, session_id)
+    req_key = _request_key(api_call_count)
+    with _STATE_LOCK:
+        state = _TRACE_STATE.get(task_key)
+        generation = state.generations.pop(req_key, None) if state else None
+    error_type = ""
+    if isinstance(error, dict):
+        error_type = str(error.get("type") or "")
+    metadata = _base_metadata(
+        "llm_request",
+        status="error",
+        error_type=error_type,
+        status_code=status_code,
+        retry_count=retry_count,
+        max_retries=max_retries,
+        retryable=retryable,
+        reason=reason,
+        api_duration_s=round(api_duration, 3) if api_duration else None,
+        model=model,
+        provider=provider,
+        base_url=base_url,
+        api_mode=api_mode,
+    )
+    if generation is not None:
+        _end_observation(
+            generation,
+            output=_safe_value(error, capture_content=False),
+            metadata=metadata,
+        )
+    if state is not None and state.root_component == "agent_turn":
+        _finish_trace(task_key, output={"status": "error", "error": metadata})
 
 
 def on_pre_tool_call(*, tool_name: str = "", args: Any = None, task_id: str = "",
@@ -966,8 +1225,13 @@ def on_pre_tool_call(*, tool_name: str = "", args: Any = None, task_id: str = ""
             client=client,
             name=f"Tool: {tool_name}",
             as_type="tool",
-            input_value=_safe_value(args),
-            metadata={"tool_name": tool_name, "tool_call_id": tool_call_id},
+            input_value=_safe_value(args, capture_content=_capture_content_enabled()),
+            metadata=_base_metadata(
+                "tool_call",
+                tool_name=tool_name,
+                tool_call_id=tool_call_id,
+                status="started",
+            ),
         )
         if tool_call_id:
             state.tools[tool_call_id] = observation
@@ -1001,7 +1265,11 @@ def on_post_tool_call(*, tool_name: str = "", args: Any = None, result: Any = No
     else:
         result_value = result
     result_value = _normalize_payload(result_value, tool_name=tool_name, args=args)
-    safe_result_value = _safe_value(result_value, parse_json_strings=True)
+    safe_result_value = _safe_value(
+        result_value,
+        parse_json_strings=True,
+        capture_content=_capture_content_enabled(),
+    )
 
     # Backfill so the generation's tool_call record carries the result alongside arguments.
     if tool_call_id:
@@ -1019,7 +1287,232 @@ def on_post_tool_call(*, tool_name: str = "", args: Any = None, result: Any = No
     _end_observation(
         observation,
         output=safe_result_value,
-        metadata={"tool_name": tool_name, "args": _safe_value(args, parse_json_strings=True)},
+        metadata=_base_metadata(
+            "tool_call",
+            tool_name=tool_name,
+            args=_safe_value(
+                args,
+                parse_json_strings=True,
+                capture_content=_capture_content_enabled(),
+            ),
+        ),
+    )
+
+
+def _ensure_boundary_trace(
+    *,
+    task_key: str,
+    trace_name: str,
+    component: str,
+    task_id: str = "",
+    session_id: str = "",
+    platform: str = "",
+    metadata: Optional[dict[str, Any]] = None,
+) -> Optional[TraceState]:
+    client = _get_langfuse()
+    if client is None:
+        return None
+    with _STATE_LOCK:
+        state = _TRACE_STATE.get(task_key)
+        if state is None:
+            state = _start_root_trace(
+                task_key,
+                task_id=task_id,
+                session_id=session_id,
+                platform=platform,
+                provider="",
+                model="",
+                api_mode="",
+                messages=[],
+                client=client,
+                trace_name=trace_name,
+                component=component,
+                input_value=_base_metadata(component, **(metadata or {})),
+                metadata_extra=metadata or {},
+            )
+            _TRACE_STATE[task_key] = state
+        state.last_updated_at = time.time()
+        return state
+
+
+def on_gateway_agent_run_start(
+    *,
+    task_id: str = "",
+    session_id: str = "",
+    session_key: str = "",
+    platform: str = "",
+    message_type: str = "",
+    text_chars: int = 0,
+    media_count: int = 0,
+    internal: bool = False,
+    **_: Any,
+) -> None:
+    task_key = _trace_key(task_id or session_id, session_id)
+    _ensure_boundary_trace(
+        task_key=task_key,
+        task_id=task_id or session_id,
+        session_id=session_id,
+        platform=platform,
+        trace_name="Hermes gateway message",
+        component="gateway_message",
+        metadata={
+            "session_key_hash": _hash_text(session_key) if session_key else "",
+            "message_type": message_type,
+            "text_chars": text_chars,
+            "media_count": media_count,
+            "internal": internal,
+        },
+    )
+
+
+def on_gateway_agent_run_finish(
+    *,
+    task_id: str = "",
+    session_id: str = "",
+    platform: str = "",
+    status: str = "",
+    duration_ms: int = 0,
+    api_calls: int = 0,
+    model: str = "",
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    error_type: str = "",
+    **_: Any,
+) -> None:
+    task_key = _trace_key(task_id or session_id, session_id)
+    output = _base_metadata(
+        "gateway_message",
+        status=status,
+        duration_ms=duration_ms,
+        api_calls=api_calls,
+        model=model,
+        platform=platform,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        error_type=error_type,
+    )
+    _finish_trace(task_key, output=output)
+
+
+def on_cron_job_start(
+    *,
+    task_id: str = "",
+    job_id: str = "",
+    job_name: str = "",
+    schedule: str = "",
+    no_agent: bool = False,
+    profile: str = "",
+    workdir_set: bool = False,
+    **_: Any,
+) -> None:
+    task_key = task_id or f"cron:{job_id}"
+    _ensure_boundary_trace(
+        task_key=task_key,
+        task_id=task_key,
+        session_id=task_key,
+        platform="cron",
+        trace_name="Hermes cron job",
+        component="cron_job",
+        metadata={
+            "job_id": job_id,
+            "job_name": job_name,
+            "schedule": schedule,
+            "no_agent": no_agent,
+            "profile": profile,
+            "workdir_set": workdir_set,
+        },
+    )
+
+
+def on_cron_job_finish(
+    *,
+    task_id: str = "",
+    job_id: str = "",
+    job_name: str = "",
+    status: str = "",
+    duration_ms: int = 0,
+    error_type: str = "",
+    delivery_error: str = "",
+    **_: Any,
+) -> None:
+    task_key = task_id or f"cron:{job_id}"
+    output = _base_metadata(
+        "cron_job",
+        job_id=job_id,
+        job_name=job_name,
+        status=status,
+        duration_ms=duration_ms,
+        error_type=error_type,
+        delivery_error=delivery_error,
+    )
+    _finish_trace(task_key, output=output)
+
+
+def on_subagent_start(
+    *,
+    parent_session_id: str = "",
+    parent_turn_id: str = "",
+    child_session_id: str = "",
+    child_subagent_id: str = "",
+    child_role: str = "",
+    child_goal: str = "",
+    **_: Any,
+) -> None:
+    client = _get_langfuse()
+    if client is None:
+        return
+    task_key = _trace_key("", parent_session_id)
+    with _STATE_LOCK:
+        state = _TRACE_STATE.get(task_key)
+        if state is None:
+            return
+        observation = _start_child_observation(
+            state,
+            client=client,
+            name=f"Subagent: {child_role or 'child'}",
+            as_type="chain",
+            input_value=_safe_value(child_goal, capture_content=False),
+            metadata=_base_metadata(
+                "subagent",
+                parent_turn_id=parent_turn_id,
+                child_session_id=child_session_id,
+                child_subagent_id=child_subagent_id,
+                child_role=child_role,
+            ),
+        )
+        state.subagents[child_subagent_id or child_session_id] = observation
+
+
+def on_subagent_stop(
+    *,
+    parent_session_id: str = "",
+    child_session_id: str = "",
+    child_subagent_id: str = "",
+    child_role: str = "",
+    child_status: str = "",
+    child_summary: str = "",
+    duration_ms: int = 0,
+    **_: Any,
+) -> None:
+    task_key = _trace_key("", parent_session_id)
+    with _STATE_LOCK:
+        state = _TRACE_STATE.get(task_key)
+        observation = None
+        if state is not None:
+            observation = state.subagents.pop(child_subagent_id or child_session_id, None)
+    if observation is None:
+        return
+    _end_observation(
+        observation,
+        output=_safe_value(child_summary, capture_content=False),
+        metadata=_base_metadata(
+            "subagent",
+            child_session_id=child_session_id,
+            child_subagent_id=child_subagent_id,
+            child_role=child_role,
+            child_status=child_status,
+            duration_ms=duration_ms,
+        ),
     )
 
 
@@ -1029,7 +1522,14 @@ def register(ctx) -> None:
     # call (preferred); pre_llm_call / post_llm_call fire once per turn.
     ctx.register_hook("pre_api_request", on_pre_llm_request)
     ctx.register_hook("post_api_request", on_post_llm_call)
+    ctx.register_hook("api_request_error", on_api_request_error)
     ctx.register_hook("pre_llm_call", on_pre_llm_call)
     ctx.register_hook("post_llm_call", on_post_llm_call)
     ctx.register_hook("pre_tool_call", on_pre_tool_call)
     ctx.register_hook("post_tool_call", on_post_tool_call)
+    ctx.register_hook("gateway_agent_run_start", on_gateway_agent_run_start)
+    ctx.register_hook("gateway_agent_run_finish", on_gateway_agent_run_finish)
+    ctx.register_hook("cron_job_start", on_cron_job_start)
+    ctx.register_hook("cron_job_finish", on_cron_job_finish)
+    ctx.register_hook("subagent_start", on_subagent_start)
+    ctx.register_hook("subagent_stop", on_subagent_stop)

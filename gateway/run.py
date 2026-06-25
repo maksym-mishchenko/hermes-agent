@@ -26,6 +26,7 @@ except ModuleNotFoundError:
 
 import asyncio
 import dataclasses
+import hashlib
 import inspect
 import json
 import logging
@@ -138,6 +139,22 @@ _GATEWAY_SECRET_PATTERNS = (
 def _gateway_platform_value(platform: Any) -> str:
     """Return a normalized gateway platform value for enums or raw strings."""
     return str(getattr(platform, "value", platform) or "").strip().lower()
+
+
+def _hash_gateway_identifier(value: Any) -> str:
+    text = str(value or "")
+    if not text:
+        return ""
+    return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _invoke_gateway_observer_hook(hook_name: str, **kwargs: Any) -> None:
+    try:
+        from hermes_cli.plugins import has_hook, invoke_hook
+        if has_hook(hook_name):
+            invoke_hook(hook_name, **kwargs)
+    except Exception:
+        logger.debug("%s hook invocation failed", hook_name, exc_info=True)
 
 
 def _is_transient_network_error(exc: BaseException) -> bool:
@@ -14275,7 +14292,49 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 }
                 if observed_group_context:
                     _conversation_kwargs["persist_user_message"] = message
-                result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+                _gateway_observer_started = time.monotonic()
+                _gateway_observer_task_id = session_id
+                _media_count = len(getattr(event, "media_urls", None) or [])
+                _invoke_gateway_observer_hook(
+                    "gateway_agent_run_start",
+                    task_id=_gateway_observer_task_id,
+                    session_id=session_id,
+                    session_key=session_key,
+                    platform=platform_key,
+                    message_type=str(getattr(event, "message_type", "") or ""),
+                    text_chars=len(str(message or "")),
+                    media_count=_media_count,
+                    internal=bool(getattr(event, "internal", False)),
+                    user_id_hash=_hash_gateway_identifier(source.user_id),
+                    chat_id_hash=_hash_gateway_identifier(source.chat_id),
+                    thread_id_hash=_hash_gateway_identifier(source.thread_id),
+                )
+                try:
+                    result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+                except Exception as _agent_exc:
+                    _invoke_gateway_observer_hook(
+                        "gateway_agent_run_finish",
+                        task_id=_gateway_observer_task_id,
+                        session_id=session_id,
+                        platform=platform_key,
+                        status="error",
+                        duration_ms=int((time.monotonic() - _gateway_observer_started) * 1000),
+                        error_type=type(_agent_exc).__name__,
+                    )
+                    raise
+                _invoke_gateway_observer_hook(
+                    "gateway_agent_run_finish",
+                    task_id=_gateway_observer_task_id,
+                    session_id=getattr(agent, "session_id", session_id),
+                    platform=platform_key,
+                    status="ok" if result.get("completed") is not False and not result.get("failed") else "error",
+                    duration_ms=int((time.monotonic() - _gateway_observer_started) * 1000),
+                    api_calls=int(result.get("api_calls") or 0),
+                    model=getattr(agent, "model", "") or result.get("model", ""),
+                    input_tokens=int(getattr(agent, "session_prompt_tokens", 0) or 0),
+                    output_tokens=int(getattr(agent, "session_completion_tokens", 0) or 0),
+                    error_type=type(result.get("error")).__name__ if result.get("error") else "",
+                )
             finally:
                 unregister_gateway_notify(_approval_session_key)
                 # Cancel any pending clarify entries so blocked agent

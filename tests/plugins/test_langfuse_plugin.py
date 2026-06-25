@@ -29,11 +29,14 @@ class TestManifest:
         data = yaml.safe_load((PLUGIN_DIR / "plugin.yaml").read_text())
         assert data["name"] == "langfuse"
         assert data["version"]
-        # All six hooks the plugin implements.
+        # Hook surface the plugin implements.
         assert set(data["hooks"]) == {
-            "pre_api_request", "post_api_request",
+            "pre_api_request", "post_api_request", "api_request_error",
             "pre_llm_call", "post_llm_call",
             "pre_tool_call", "post_tool_call",
+            "gateway_agent_run_start", "gateway_agent_run_finish",
+            "cron_job_start", "cron_job_finish",
+            "subagent_start", "subagent_stop",
         }
         # Required env vars are the user-facing HERMES_ prefixed keys.
         assert "HERMES_LANGFUSE_PUBLIC_KEY" in data["requires_env"]
@@ -152,7 +155,7 @@ class TestRuntimeGate:
 
 class TestHooksInert:
     def test_hooks_noop_without_client(self, monkeypatch):
-        """All 6 hooks must return without raising when _get_langfuse() is None."""
+        """All hooks must return without raising when _get_langfuse() is None."""
         for k in (
             "HERMES_LANGFUSE_PUBLIC_KEY", "HERMES_LANGFUSE_SECRET_KEY",
             "LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY",
@@ -169,9 +172,40 @@ class TestHooksInert:
         mod.on_post_llm_call(task_id="t", session_id="s", api_call_count=1)
         mod.on_pre_tool_call(tool_name="read_file", args={}, task_id="t", session_id="s")
         mod.on_post_tool_call(tool_name="read_file", args={}, result="ok", task_id="t", session_id="s")
+        mod.on_api_request_error(task_id="t", session_id="s", api_call_count=1, error={"type": "boom"})
+        mod.on_gateway_agent_run_start(task_id="t", session_id="s", session_key="secret-session-key")
+        mod.on_gateway_agent_run_finish(task_id="t", session_id="s", status="ok")
+        mod.on_cron_job_start(task_id="cron:t", job_id="j", job_name="job")
+        mod.on_cron_job_finish(task_id="cron:t", job_id="j", status="ok")
+        mod.on_subagent_start(parent_session_id="s", child_session_id="c", child_goal="do work")
+        mod.on_subagent_stop(parent_session_id="s", child_session_id="c", child_summary="done")
 
 
 class TestPayloadSanitization:
+    def test_safe_value_redacts_sensitive_keys_and_secret_patterns(self):
+        sys.modules.pop("plugins.observability.langfuse", None)
+        mod = importlib.import_module("plugins.observability.langfuse")
+
+        result = mod._safe_value({
+            "api_key": "sk-test-secret-value",
+            "message": "Authorization: Bearer abcdefghijklmnopqrstuvwxyz123",
+        })
+
+        assert result["api_key"] == "<redacted>"
+        assert "abcdefghijklmnopqrstuvwxyz123" not in result["message"]
+        assert "Bearer [REDACTED]" in result["message"]
+
+    def test_capture_content_disabled_summarizes_text(self):
+        sys.modules.pop("plugins.observability.langfuse", None)
+        mod = importlib.import_module("plugins.observability.langfuse")
+
+        result = mod._safe_value("sensitive prompt text", capture_content=False)
+
+        assert result["type"] == "text"
+        assert result["chars"] == len("sensitive prompt text")
+        assert result["sha256"]
+        assert "sensitive prompt text" not in str(result)
+
     def test_safe_value_redacts_base64_data_uri_instead_of_truncating(self):
         sys.modules.pop("plugins.observability.langfuse", None)
         import importlib
@@ -545,9 +579,35 @@ class TestToolCallOutputBackfill:
         assert ended["observation"] is observation
         assert state.turn_tool_calls[0]["output"] == ended["output"]
         assert state.turn_tool_calls[0]["function"]["output"] == ended["output"]
-        assert state.turn_tool_calls[0]["output"] == {
-            "results": [{"url": "https://example.com", "content": "Example Domain"}]
-        }
+        assert state.turn_tool_calls[0]["output"]["results"][0]["url"] == "https://example.com"
+        assert state.turn_tool_calls[0]["output"]["results"][0]["content"]["type"] == "text"
+        assert "Example Domain" not in str(state.turn_tool_calls[0]["output"])
+
+    def test_post_tool_call_can_capture_content_when_explicitly_enabled(self, monkeypatch):
+        sys.modules.pop("plugins.observability.langfuse", None)
+        mod = importlib.import_module("plugins.observability.langfuse")
+        monkeypatch.setenv("HERMES_LANGFUSE_CAPTURE_CONTENT", "true")
+
+        obs = object()
+        state = mod.TraceState(trace_id="trace-1", root_ctx=None, root_span=None)
+        state.tools["call-1"] = obs
+        monkeypatch.setitem(mod._TRACE_STATE, mod._trace_key("task-1", "session-1"), state)
+        ended = {}
+
+        def fake_end_observation(o, *, output=None, metadata=None, **_):
+            ended["output"] = output
+
+        monkeypatch.setattr(mod, "_end_observation", fake_end_observation)
+        mod.on_post_tool_call(
+            tool_name="web_extract",
+            args={},
+            result='{"content": "Example Domain"}',
+            task_id="task-1",
+            session_id="session-1",
+            tool_call_id="call-1",
+        )
+
+        assert ended["output"] == {"content": "Example Domain"}
 
     def test_serialize_messages_keeps_tool_name_and_call_id(self):
         sys.modules.pop("plugins.observability.langfuse", None)
@@ -580,14 +640,21 @@ class TestToolCallOutputBackfill:
             type = "function"
             function = _Fn()
 
+        expected_arguments = {
+            "type": "text",
+            "chars": len('{"urls": ["https://example.com"]}'),
+            "lines": 1,
+            "sha256": mod._hash_text('{"urls": ["https://example.com"]}'),
+            "empty": False,
+        }
         assert mod._serialize_tool_calls([_ToolCall()]) == [{
             "id": "call-1",
             "type": "function",
             "name": "web_extract",
-            "arguments": '{"urls": ["https://example.com"]}',
+            "arguments": expected_arguments,
             "function": {
                 "name": "web_extract",
-                "arguments": '{"urls": ["https://example.com"]}',
+                "arguments": expected_arguments,
             },
         }]
 

@@ -222,6 +222,32 @@ and `child_goal`.
 Observers can use these hooks to model nested trajectories while keeping child
 agent execution linked to the parent turn that spawned it.
 
+### Gateway Agent Runs
+
+Gateway hooks describe one inbound platform message that reaches the agent:
+
+| Hook | When it fires |
+| --- | --- |
+| `gateway_agent_run_start` | Immediately before a gateway message enters `AIAgent.run_conversation`. |
+| `gateway_agent_run_finish` | After the gateway agent run completes or raises. |
+
+Common fields include `session_id`, `task_id`, `session_key`, `platform`,
+`message_type`, `text_chars`, `media_count`, hashed user/chat/thread IDs,
+`status`, `duration_ms`, `api_calls`, `model`, `input_tokens`,
+`output_tokens`, and `error_type`.
+
+### Cron Jobs
+
+Cron hooks describe scheduled work at the job boundary:
+
+| Hook | When it fires |
+| --- | --- |
+| `cron_job_start` | Before a due job starts executing, including script-only jobs. |
+| `cron_job_finish` | After the job returns, fails, or is skipped as silent. |
+
+Common fields include `job_id`, `job_name`, `schedule`, `no_agent`, `profile`,
+`workdir_set`, `status`, `duration_ms`, `error_type`, and `delivery_error`.
+
 ## Payload Safety
 
 Observer payloads are designed for telemetry consumers, not raw object access.
@@ -308,7 +334,8 @@ nested agent work or security lifecycle events.
 ## Existing Consumers
 
 The bundled Langfuse plugin demonstrates direct hook-based observability for
-turns, provider requests, and tool calls.
+turns, provider requests, tool calls, gateway agent runs, cron jobs, and
+delegated subagents.
 
 The bundled NeMo Relay plugin maps the same generic observer contract to NeMo
 Relay scopes, LLM spans, tool spans, marks, ATOF streams, and ATIF exports.

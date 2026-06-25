@@ -7,9 +7,46 @@ from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
+import cron.scheduler as scheduler
 from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
+
+
+def test_run_job_emits_cron_observer_hooks(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(
+        scheduler,
+        "_invoke_observer_hook",
+        lambda name, **kwargs: events.append((name, kwargs)),
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "_run_job_impl",
+        lambda job: (True, "doc", "final response", None),
+    )
+
+    success, output, final_response, error = scheduler.run_job({
+        "id": "job-1",
+        "name": "Nightly check",
+        "schedule_display": "every day 09:00",
+        "workdir": "/tmp/project",
+    })
+
+    assert (success, output, final_response, error) == (
+        True,
+        "doc",
+        "final response",
+        None,
+    )
+    assert [name for name, _ in events] == ["cron_job_start", "cron_job_finish"]
+    assert events[0][1]["job_id"] == "job-1"
+    assert events[0][1]["job_name"] == "Nightly check"
+    assert events[0][1]["schedule"] == "every day 09:00"
+    assert events[0][1]["workdir_set"] is True
+    assert events[1][1]["status"] == "ok"
+    assert events[1][1]["duration_ms"] >= 0
 
 
 class TestResolveOrigin:
