@@ -22,6 +22,7 @@ Optional env vars:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -49,6 +50,7 @@ class TraceState:
     tools: Dict[str, Any] = field(default_factory=dict)
     pending_tools_by_name: Dict[str, list] = field(default_factory=dict)
     turn_tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    root_component: str = "agent_turn"
     last_updated_at: float = field(default_factory=time.time)
 
 
@@ -90,6 +92,25 @@ def _env_bool(*names: str) -> bool:
         if value:
             return value in {"1", "true", "yes", "on"}
     return False
+
+
+def _hash_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _base_metadata(component: str, **fields: Any) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "service": _env("HERMES_LANGFUSE_SERVICE", "hermes-agent") or "hermes-agent",
+        "source": "hermes",
+        "component": component,
+    }
+    environment = _env("HERMES_LANGFUSE_ENV") or _env("LANGFUSE_ENV")
+    if environment:
+        metadata["environment"] = environment
+    for key, value in fields.items():
+        if value not in (None, ""):
+            metadata[key] = _safe_value(value)
+    return metadata
 
 
 def _debug_enabled() -> bool:
@@ -602,9 +623,12 @@ def _usage_and_cost(response: Any, *, provider: str, api_mode: str, model: str, 
 
 def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform: str, provider: str, model: str,
                       api_mode: str, messages: Any, client: Langfuse,
-                      turn_id: str = "", api_request_id: str = "") -> TraceState:
+                      turn_id: str = "", api_request_id: str = "",
+                      trace_name: str = "Hermes turn", component: str = "agent_turn",
+                      input_value: Any = None,
+                      metadata_extra: Optional[dict[str, Any]] = None) -> TraceState:
     trace_id = client.create_trace_id(seed=f"{session_id or 'sessionless'}::{task_id or task_key}")
-    trace_input = _extract_last_user_message(messages)
+    trace_input = input_value if input_value is not None else _extract_last_user_message(messages)
     metadata = {
         "source": "hermes",
         "task_id": task_id,
@@ -614,7 +638,12 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
         "provider": provider,
         "model": model,
         "api_mode": api_mode,
+        "component": component,
     }
+    if metadata_extra:
+        for _k, _v in metadata_extra.items():
+            if _v not in (None, ""):
+                metadata[_k] = _safe_value(_v)
 
     # session_id must be passed in trace_context for Langfuse session grouping.
     trace_ctx: Dict[str, Any] = {"trace_id": trace_id}
@@ -625,12 +654,12 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
         try:
             with propagate_attributes(
                 session_id=session_id or task_key,
-                trace_name="Hermes turn",
-                tags=["hermes", "langfuse"],
+                trace_name=trace_name,
+                tags=["hermes", "langfuse", component],
             ):
                 root_ctx = client.start_as_current_observation(
                     trace_context=trace_ctx,
-                    name="Hermes turn",
+                    name=trace_name,
                     as_type="chain",
                     input=trace_input,
                     metadata=metadata,
@@ -640,7 +669,7 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
         except Exception:
             root_ctx = client.start_as_current_observation(
                 trace_context=trace_ctx,
-                name="Hermes turn",
+                name=trace_name,
                 as_type="chain",
                 input=trace_input,
                 metadata=metadata,
@@ -650,7 +679,7 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
     else:
         root_ctx = client.start_as_current_observation(
             trace_context=trace_ctx,
-            name="Hermes turn",
+            name=trace_name,
             as_type="chain",
             input=trace_input,
             metadata=metadata,
@@ -664,7 +693,8 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
         pass
 
     _debug(f"started trace {trace_id} for {task_key}")
-    return TraceState(trace_id=trace_id, root_ctx=root_ctx, root_span=root_span)
+    return TraceState(trace_id=trace_id, root_ctx=root_ctx, root_span=root_span,
+                      root_component=component)
 
 
 def _start_child_observation(state: TraceState, *, client: Langfuse, name: str, as_type: str,
@@ -1125,6 +1155,123 @@ def on_post_tool_call(*, tool_name: str = "", args: Any = None, result: Any = No
     )
 
 
+def _ensure_boundary_trace(task_key: str, *, session_id: str, platform: str,
+                           trace_name: str, component: str,
+                           metadata: Optional[dict[str, Any]] = None) -> Optional[TraceState]:
+    """Get-or-create a root trace for a gateway/cron boundary event.
+
+    Boundary traces are not scoped to an agent turn (no ``turn_id``), so their
+    ``task_key`` cannot collide with the per-turn LLM traces.
+    """
+    client = _get_langfuse()
+    if client is None:
+        return None
+    with _STATE_LOCK:
+        existing = _TRACE_STATE.get(task_key)
+        if existing is not None:
+            existing.last_updated_at = time.time()
+            return existing
+        state = _start_root_trace(
+            task_key,
+            task_id=task_key,
+            session_id=session_id,
+            platform=platform,
+            provider="",
+            model="",
+            api_mode="",
+            messages=[],
+            client=client,
+            trace_name=trace_name,
+            component=component,
+            input_value=_base_metadata(component, **(metadata or {})),
+            metadata_extra=metadata or {},
+        )
+        _TRACE_STATE[task_key] = state
+        state.last_updated_at = time.time()
+    return state
+
+
+def on_gateway_agent_run_start(*, task_id: str = "", session_id: str = "", session_key: str = "",
+                               platform: str = "", message_type: str = "", text_chars: int = 0,
+                               media_count: int = 0, internal: bool = False,
+                               user_id_hash: str = "", chat_id_hash: str = "",
+                               thread_id_hash: str = "", **_: Any) -> None:
+    task_key = _trace_key(task_id or session_id, session_id)
+    _ensure_boundary_trace(
+        task_key,
+        session_id=session_id,
+        platform=platform,
+        trace_name="Hermes gateway message",
+        component="gateway_message",
+        metadata={
+            "session_key_hash": _hash_text(session_key) if session_key else "",
+            "platform": platform,
+            "message_type": message_type,
+            "text_chars": text_chars,
+            "media_count": media_count,
+            "internal": internal,
+            "user_id_hash": user_id_hash,
+            "chat_id_hash": chat_id_hash,
+            "thread_id_hash": thread_id_hash,
+        },
+    )
+
+
+def on_gateway_agent_run_finish(*, task_id: str = "", session_id: str = "", session_key: str = "",
+                                platform: str = "", status: str = "", duration_ms: int = 0,
+                                api_calls: int = 0, model: str = "", input_tokens: int = 0,
+                                output_tokens: int = 0, error_type: str = "", **_: Any) -> None:
+    task_key = _trace_key(task_id or session_id, session_id)
+    output = _base_metadata(
+        "gateway_message",
+        status=status,
+        duration_ms=duration_ms,
+        api_calls=api_calls,
+        model=model,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        error_type=error_type,
+    )
+    _finish_trace(task_key, output=output)
+
+
+def on_cron_job_start(*, task_id: str = "", job_id: str = "", job_name: str = "",
+                      schedule: str = "", no_agent: bool = False, profile: str = "",
+                      workdir_set: bool = False, **_: Any) -> None:
+    task_key = task_id or f"cron:{job_id}"
+    _ensure_boundary_trace(
+        task_key,
+        session_id="",
+        platform="cron",
+        trace_name="Hermes cron job",
+        component="cron_job",
+        metadata={
+            "job_id": job_id,
+            "job_name": job_name,
+            "schedule": schedule,
+            "no_agent": no_agent,
+            "profile": profile,
+            "workdir_set": workdir_set,
+        },
+    )
+
+
+def on_cron_job_finish(*, task_id: str = "", job_id: str = "", job_name: str = "",
+                       status: str = "", duration_ms: int = 0, error_type: str = "",
+                       delivery_error: str = "", **_: Any) -> None:
+    task_key = task_id or f"cron:{job_id}"
+    output = _base_metadata(
+        "cron_job",
+        job_id=job_id,
+        job_name=job_name,
+        status=status,
+        duration_ms=duration_ms,
+        error_type=error_type,
+        delivery_error=delivery_error,
+    )
+    _finish_trace(task_key, output=output)
+
+
 def register(ctx) -> None:
     # Register for both hook name variants so the plugin works across
     # Hermes versions.  pre_api_request / post_api_request fire per API
@@ -1135,3 +1282,7 @@ def register(ctx) -> None:
     ctx.register_hook("post_llm_call", on_post_llm_call)
     ctx.register_hook("pre_tool_call", on_pre_tool_call)
     ctx.register_hook("post_tool_call", on_post_tool_call)
+    ctx.register_hook("gateway_agent_run_start", on_gateway_agent_run_start)
+    ctx.register_hook("gateway_agent_run_finish", on_gateway_agent_run_finish)
+    ctx.register_hook("cron_job_start", on_cron_job_start)
+    ctx.register_hook("cron_job_finish", on_cron_job_finish)

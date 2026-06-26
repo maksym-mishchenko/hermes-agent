@@ -43,8 +43,23 @@ HERMES_LANGFUSE_ENV=production       # environment tag
 HERMES_LANGFUSE_RELEASE=v1.0.0       # release tag
 HERMES_LANGFUSE_SAMPLE_RATE=0.5      # sample 50% of traces
 HERMES_LANGFUSE_MAX_CHARS=12000      # max chars per field (default: 12000)
+HERMES_LANGFUSE_SERVICE=hermes-agent # service tag for traces
 HERMES_LANGFUSE_DEBUG=true           # verbose plugin logging
 ```
+
+## What is traced
+
+The plugin consumes Hermes observer hooks and emits stable Langfuse traces and
+spans for:
+
+- agent turns and provider API attempts (`pre_api_request`, `post_api_request`)
+- tool calls (`pre_tool_call`, `post_tool_call`)
+- gateway agent runs (`gateway_agent_run_start`, `gateway_agent_run_finish`)
+- cron jobs (`cron_job_start`, `cron_job_finish`)
+
+Trace metadata includes service, component, environment, session/task IDs,
+job IDs/names, provider/model/API mode, status/error class, duration, and token
+usage where Hermes already has that data.
 
 ## Disable
 

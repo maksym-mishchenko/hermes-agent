@@ -26,6 +26,7 @@ except ModuleNotFoundError:
 
 import asyncio
 import dataclasses
+import hashlib
 import inspect
 import json
 import logging
@@ -193,6 +194,33 @@ def _ensure_windows_gateway_venv_imports() -> None:
 def _gateway_platform_value(platform: Any) -> str:
     """Return a normalized gateway platform value for enums or raw strings."""
     return str(getattr(platform, "value", platform) or "").strip().lower()
+
+
+def _hash_gateway_identifier(value: Any) -> str:
+    """Return a stable sha256 hex digest of an identifier (empty for blanks).
+
+    Used to emit user/chat/thread identifiers into telemetry without exposing
+    the raw values to observability backends.
+    """
+    text = str(value or "")
+    if not text:
+        return ""
+    return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _invoke_gateway_observer_hook(hook_name: str, **kwargs: Any) -> None:
+    """Fire a plugin observer hook fire-and-forget; never raise to the caller.
+
+    Telemetry must not affect the agent run, so any plugin/import error is
+    swallowed and logged at debug level only.
+    """
+    try:
+        from hermes_cli.plugins import has_hook, invoke_hook
+
+        if has_hook(hook_name):
+            invoke_hook(hook_name, **kwargs)
+    except Exception:
+        logger.debug("%s hook invocation failed", hook_name, exc_info=True)
 
 
 def _non_conversational_metadata(
@@ -9391,6 +9419,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=event.channel_prompt,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                event=event,
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -14130,6 +14159,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         channel_prompt: Optional[str] = None,
         persist_user_message: Optional[str] = None,
         persist_user_timestamp: Optional[float] = None,
+        event: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -14147,6 +14177,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
                 channel_prompt=channel_prompt, persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                event=event,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -14157,6 +14188,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
                 channel_prompt=channel_prompt, persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                event=event,
             )
 
     def _resolve_profile_home_for_source(self, source: SessionSource) -> "Path":
@@ -14188,6 +14220,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         channel_prompt: Optional[str] = None,
         persist_user_message: Optional[str] = None,
         persist_user_timestamp: Optional[float] = None,
+        event: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -15770,7 +15803,56 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _conversation_kwargs["persist_user_message"] = message
                 if _persist_user_timestamp_override is not None:
                     _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
-                result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+                # ---- Langfuse/observer telemetry: gateway agent run ----
+                _gateway_observer_started = time.monotonic()
+                _invoke_gateway_observer_hook(
+                    "gateway_agent_run_start",
+                    task_id=session_id,
+                    session_id=session_id,
+                    session_key=session_key,
+                    platform=platform_key,
+                    message_type=str(getattr(event, "message_type", "") or ""),
+                    text_chars=len(str(message or "")),
+                    media_count=len(getattr(event, "media_urls", None) or []),
+                    internal=bool(getattr(event, "internal", False)),
+                    user_id_hash=_hash_gateway_identifier(getattr(source, "user_id", None)),
+                    chat_id_hash=_hash_gateway_identifier(getattr(source, "chat_id", None)),
+                    thread_id_hash=_hash_gateway_identifier(getattr(source, "thread_id", None)),
+                )
+                try:
+                    result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+                except Exception as _agent_exc:
+                    _invoke_gateway_observer_hook(
+                        "gateway_agent_run_finish",
+                        task_id=session_id,
+                        session_id=getattr(agent, "session_id", session_id),
+                        session_key=session_key,
+                        platform=platform_key,
+                        status="error",
+                        duration_ms=int((time.monotonic() - _gateway_observer_started) * 1000),
+                        error_type=type(_agent_exc).__name__,
+                    )
+                    raise
+                _invoke_gateway_observer_hook(
+                    "gateway_agent_run_finish",
+                    task_id=session_id,
+                    session_id=getattr(agent, "session_id", session_id),
+                    session_key=session_key,
+                    platform=platform_key,
+                    status=(
+                        "ok"
+                        if result.get("completed") is not False and not result.get("failed")
+                        else "error"
+                    ),
+                    duration_ms=int((time.monotonic() - _gateway_observer_started) * 1000),
+                    api_calls=int(result.get("api_calls") or 0),
+                    model=getattr(agent, "model", "") or result.get("model", ""),
+                    input_tokens=int(getattr(agent, "session_prompt_tokens", 0) or 0),
+                    output_tokens=int(getattr(agent, "session_completion_tokens", 0) or 0),
+                    error_type=(
+                        type(result.get("error")).__name__ if result.get("error") else ""
+                    ),
+                )
             finally:
                 unregister_gateway_notify(_approval_session_key)
                 # Cancel any pending clarify entries so blocked agent
@@ -16682,6 +16764,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
+                    event=pending_event,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
