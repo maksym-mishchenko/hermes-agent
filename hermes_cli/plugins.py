@@ -192,6 +192,20 @@ VALID_HOOKS: Set[str] = {
     "kanban_task_claimed",
     "kanban_task_completed",
     "kanban_task_blocked",
+    # Gateway agent-run telemetry hooks. Fired by gateway/run.py around the
+    # per-turn agent.run_conversation() call. Observers only: return values
+    # ignored. gateway_agent_run_start fires before the run with inbound
+    # event-derived fields (message_type, media_count, internal, hashed
+    # identifiers); gateway_agent_run_finish fires after with status
+    # (ok/error), duration_ms, token counts, api_calls, and model.
+    "gateway_agent_run_start",
+    "gateway_agent_run_finish",
+    # Cron job telemetry hooks. Fired by cron/scheduler.py around each
+    # scheduled job run. Observers only. cron_job_start fires before the job
+    # with job_id/name/schedule/no_agent/profile; cron_job_finish fires after
+    # with status (ok/error/silent), duration_ms, and error_type.
+    "cron_job_start",
+    "cron_job_finish",
 }
 
 ENTRY_POINTS_GROUP = "hermes_agent.plugins"
