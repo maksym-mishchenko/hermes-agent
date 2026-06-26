@@ -29,11 +29,13 @@ class TestManifest:
         data = yaml.safe_load((PLUGIN_DIR / "plugin.yaml").read_text())
         assert data["name"] == "langfuse"
         assert data["version"]
-        # All six hooks the plugin implements.
+        # All hooks the plugin implements.
         assert set(data["hooks"]) == {
             "pre_api_request", "post_api_request",
             "pre_llm_call", "post_llm_call",
             "pre_tool_call", "post_tool_call",
+            "gateway_agent_run_start", "gateway_agent_run_finish",
+            "cron_job_start", "cron_job_finish",
         }
         # Required env vars are the user-facing HERMES_ prefixed keys.
         assert "HERMES_LANGFUSE_PUBLIC_KEY" in data["requires_env"]
@@ -169,6 +171,10 @@ class TestHooksInert:
         mod.on_post_llm_call(task_id="t", session_id="s", api_call_count=1)
         mod.on_pre_tool_call(tool_name="read_file", args={}, task_id="t", session_id="s")
         mod.on_post_tool_call(tool_name="read_file", args={}, result="ok", task_id="t", session_id="s")
+        mod.on_gateway_agent_run_start(task_id="t", session_id="s", session_key="secret-session-key")
+        mod.on_gateway_agent_run_finish(task_id="t", session_id="s", status="ok")
+        mod.on_cron_job_start(task_id="cron:t", job_id="j", job_name="job")
+        mod.on_cron_job_finish(task_id="cron:t", job_id="j", status="ok")
 
 
 class TestPayloadSanitization:
