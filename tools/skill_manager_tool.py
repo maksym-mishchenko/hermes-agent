@@ -424,16 +424,44 @@ def _validate_frontmatter(content: str) -> Optional[str]:
 def _validate_content_size(content: str, label: str = "SKILL.md") -> Optional[str]:
     """Check that content doesn't exceed the character limit for agent writes.
 
-    Returns an error message or None if within bounds.
+    Returns a directive, actionable error message or None if within bounds.
+
+    The message is intentionally prescriptive: an oversized write never reaches
+    disk, so retrying the *same* content is futile. The caller must reduce the
+    payload (by moving content into supporting files), not resubmit it.
     """
-    if len(content) > MAX_SKILL_CONTENT_CHARS:
-        return (
-            f"{label} content is {len(content):,} characters "
-            f"(limit: {MAX_SKILL_CONTENT_CHARS:,}). "
-            f"Consider splitting into a smaller SKILL.md with supporting files "
-            f"in references/ or templates/."
+    size = len(content)
+    if size <= MAX_SKILL_CONTENT_CHARS:
+        return None
+
+    overage = size - MAX_SKILL_CONTENT_CHARS
+    is_main = label == "SKILL.md"
+    allowed = ", ".join(sorted(ALLOWED_SUBDIRS))
+
+    header = (
+        f"{label} content is {size:,} characters, which is {overage:,} over the "
+        f"{MAX_SKILL_CONTENT_CHARS:,}-character limit. The write was REJECTED and "
+        f"nothing was saved. Do NOT retry the same content — it will fail again. "
+        f"You must shrink the payload first:"
+    )
+
+    if is_main:
+        recipe = (
+            f" Move the largest sections (long examples, reference tables, "
+            f"verbose procedures) out of SKILL.md into supporting files via "
+            f"skill_manage(action=\"write_file\", file_path=\"references/<topic>.md\", ...), "
+            f"then replace those sections in SKILL.md with a short pointer to the "
+            f"file. Allowed subdirectories: {allowed}. Keep SKILL.md focused on "
+            f"when/how to use the skill and link out to the details."
         )
-    return None
+    else:
+        recipe = (
+            f" Split this file into several smaller files (e.g. "
+            f"{label}, plus additional files under one of: {allowed}) so each stays "
+            f"under the limit, and reference them from SKILL.md."
+        )
+
+    return header + recipe
 
 
 def _resolve_skill_dir(name: str, category: str = None) -> Path:

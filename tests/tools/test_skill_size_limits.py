@@ -58,6 +58,26 @@ class TestValidateContentSize:
         err = _validate_content_size("a" * (MAX_SKILL_CONTENT_CHARS + 1), label="references/api.md")
         assert "references/api.md" in err
 
+    def test_over_limit_message_is_directive(self):
+        """The message must tell the caller to stop retrying and how to split."""
+        over = MAX_SKILL_CONTENT_CHARS + 1234
+        err = _validate_content_size("a" * over)
+        # Reports the overage explicitly so the caller knows how much to cut.
+        assert "1,234" in err
+        # Tells the caller not to resubmit the same payload.
+        assert "not retry" in err.lower() or "do not retry" in err.lower()
+        # SKILL.md case points at moving sections into references/.
+        assert "references/" in err
+        assert "write_file" in err
+
+    def test_over_limit_supporting_file_suggests_split(self):
+        """For a supporting file, the message suggests splitting into files."""
+        err = _validate_content_size(
+            "a" * (MAX_SKILL_CONTENT_CHARS + 1), label="references/big.md"
+        )
+        assert "split" in err.lower()
+        assert "references/big.md" in err
+
 
 class TestCreateSkillSizeLimit:
     """create action rejects oversized content."""
@@ -72,6 +92,8 @@ class TestCreateSkillSizeLimit:
         result = json.loads(skill_manage(action="create", name="huge-skill", content=content))
         assert result["success"] is False
         assert "100,000" in result["error"]
+        # Nothing was written to disk — the pre-flight check rejects before saving.
+        assert not (isolate_skills / "huge-skill").exists()
 
     def test_create_at_limit(self, isolate_skills):
         # Content at exactly the limit should succeed

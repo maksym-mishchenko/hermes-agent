@@ -379,6 +379,37 @@ $HERMES_HOME/skills/        Installed skills
 
 Profiles use `~/.hermes/profiles/<name>/` with the same layout.
 
+### Querying the session store
+
+The canonical record of past runs ("missions") lives in the `sessions` table of
+`~/.hermes/state.db` (SQLite). **There is no `missions` table** — do not query
+one. Timestamps are `started_at` / `ended_at` (REAL Unix epoch seconds), **not**
+`created_at` / `finished_at`.
+
+Prefer the `hermes sessions` CLI (`list`, `stats`, `browse`, `export`) over raw
+SQL. If you do query directly, the load-bearing columns are:
+
+| Column | Meaning |
+|--------|---------|
+| `id` | Session identifier |
+| `source` | Origin (`cli`, `telegram`, `cron`, …) |
+| `started_at` | Start time (epoch seconds) |
+| `ended_at` | End time (epoch seconds, NULL if still open) |
+| `end_reason` | Why it ended |
+| `message_count` | Messages exchanged |
+| `model` | Model used |
+| `title` | Human-readable title |
+| `archived` | 1 if archived, else 0 |
+
+```sql
+-- Recent finished sessions, newest first:
+SELECT id, source, started_at, ended_at, message_count, title
+FROM sessions
+WHERE ended_at IS NOT NULL
+ORDER BY started_at DESC
+LIMIT 20;
+```
+
 ### Config Sections
 
 Edit with `hermes config edit` or `hermes config set section.key value`.

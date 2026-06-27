@@ -190,6 +190,51 @@ class TestApiKeyHeaders:
         assert "anotherOpaqueSecret" not in result
 
 
+class TestShellReferencesPreserved:
+    """Shell substitutions/variables in header values must survive redaction.
+
+    Masking ``$(gh auth token)`` to ``***`` drops the ``$(`` opener but leaves a
+    dangling ``)``, producing ``eval: syntax error near unexpected token ')'``.
+    These are runtime references, not literal secrets — leave them intact.
+    """
+
+    def test_gh_auth_token_command_substitution_in_auth_header(self):
+        text = 'curl -H "AUTHORIZATION: bearer $(gh auth token)" https://api.github.com'
+        result = redact_sensitive_text(text, force=True)
+        # The substitution survives balanced — no corruption, no masking.
+        assert "$(gh auth token)" in result
+        assert "***" not in result
+
+    def test_backtick_substitution_in_auth_header(self):
+        text = "Authorization: Bearer `gh auth token`"
+        result = redact_sensitive_text(text, force=True)
+        assert "`gh auth token`" in result
+        assert "***" not in result
+
+    def test_env_var_in_auth_header(self):
+        text = "Authorization: Bearer $GH_TOKEN"
+        result = redact_sensitive_text(text, force=True)
+        assert "$GH_TOKEN" in result
+
+    def test_braced_env_var_in_secret_header(self):
+        text = 'curl -H "x-api-key: ${MY_API_KEY}" https://api.example.com'
+        result = redact_sensitive_text(text, force=True)
+        assert "${MY_API_KEY}" in result
+        assert "https://api.example.com" in result
+
+    def test_command_substitution_in_secret_header(self):
+        text = 'curl -H "x-api-key: $(cat /run/secrets/key)" https://x'
+        result = redact_sensitive_text(text, force=True)
+        assert "$(cat /run/secrets/key)" in result
+
+    def test_real_token_still_masked_alongside_shell_ref_logic(self):
+        # The shell-ref guard must not weaken masking of genuine opaque tokens.
+        token = "ghp_" + "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+        text = f"Authorization: Bearer {token}"
+        result = redact_sensitive_text(text, force=True)
+        assert token not in result
+
+
 class TestTelegramTokens:
     def test_bot_token(self):
         text = "bot123456789:ABCDEfghij-KLMNopqrst_UVWXyz12345"
