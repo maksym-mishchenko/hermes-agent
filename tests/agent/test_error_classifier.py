@@ -127,6 +127,18 @@ class TestExtractErrorBody:
         e = MockAPIError("fail", body={"error": {"message": "bad"}})
         assert _extract_error_body(e) == {"error": {"message": "bad"}}
 
+    def test_from_cause_chain_body_attr(self):
+        inner = MockAPIError(
+            "inner",
+            status_code=402,
+            body={"error": {"message": "Usage limit reached, try again in 5 minutes"}},
+        )
+        outer = Exception("outer")
+        outer.__cause__ = inner
+        assert _extract_error_body(outer) == {
+            "error": {"message": "Usage limit reached, try again in 5 minutes"},
+        }
+
     def test_empty_when_no_body(self):
         assert _extract_error_body(Exception("generic")) == {}
 
@@ -300,6 +312,21 @@ class TestClassifyApiError:
         assert result.retryable is False
         assert result.should_fallback is True
 
+    def test_wrapped_402_uses_nested_body_message(self):
+        inner = MockAPIError(
+            "inner",
+            status_code=402,
+            body={"error": {"message": "Usage limit reached, try again in 5 minutes"}},
+        )
+        outer = Exception("outer")
+        outer.__cause__ = inner
+
+        result = classify_api_error(outer)
+
+        assert result.reason == FailoverReason.rate_limit
+        assert result.retryable is True
+        assert result.message == "Usage limit reached, try again in 5 minutes"
+
     # ── Rate limit ──
 
     def test_429_rate_limit(self):
@@ -346,6 +373,42 @@ class TestClassifyApiError:
         e = MockAPIError("Overloaded", status_code=529)
         result = classify_api_error(e)
         assert result.reason == FailoverReason.overloaded
+
+    def test_message_only_overloaded_without_status_is_overloaded(self):
+        """Some Anthropic-compatible proxies surface 'overloaded' in the
+        message with no 503/529 status_code. It must classify as overloaded
+        (transient backoff+retry), not unknown / credential rotation. (#14261)"""
+        e = MockAPIError(
+            "Anthropic API error: Overloaded - the service is temporarily overloaded"
+        )  # no status_code
+        result = classify_api_error(e, provider="anthropic")
+        assert result.reason == FailoverReason.overloaded
+        assert result.retryable is True
+        assert result.should_rotate_credential is False
+
+    def test_429_with_overloaded_body_is_overloaded_not_rate_limit(self):
+        """Z.AI / Zhipu reuse HTTP 429 for server-wide overload. The credential
+        is valid — the server is just busy — so it must classify as overloaded
+        (back off + retry the same key), NOT rate_limit (which would rotate and
+        exhaust the pool, doing nothing for a single-key user). (#14038)"""
+        e = MockAPIError(
+            "The service may be temporarily overloaded, please try again later",
+            status_code=429,
+        )
+        result = classify_api_error(e, provider="zai")
+        assert result.reason == FailoverReason.overloaded
+        assert result.retryable is True
+        assert result.should_rotate_credential is False
+
+    def test_429_normal_rate_limit_still_rotates(self):
+        """Guard: a genuine 429 rate limit (no overload language) must still
+        classify as rate_limit and rotate the credential. (#14038)"""
+        e = MockAPIError(
+            "Rate limit exceeded: too many requests", status_code=429
+        )
+        result = classify_api_error(e, provider="zai")
+        assert result.reason == FailoverReason.rate_limit
+        assert result.should_rotate_credential is True
 
     # ── 5xx that are actually request-validation errors ──
     # Some OpenAI-compatible gateways (e.g. codex.nekos.me) return
@@ -659,6 +722,42 @@ class TestClassifyApiError:
         e = MockAPIError("invalid signature", status_code=400)
         result = classify_api_error(e, provider="openrouter", approx_tokens=0)
         # Without "thinking" in the message, it shouldn't be thinking_signature
+        assert result.reason != FailoverReason.thinking_signature
+
+    def test_anthropic_thinking_blocks_cannot_be_modified(self):
+        """Frozen-block mutation 400 (no 'signature' token) must route to
+        thinking_signature recovery, not hard-abort. Regression for the
+        real-world error: latest-assistant thinking blocks 'cannot be
+        modified' after upstream message mutation."""
+        e = MockAPIError(
+            "messages.73.content.10: `thinking` or `redacted_thinking` blocks "
+            "in the latest assistant message cannot be modified. These blocks "
+            "must remain as they were in the original response.",
+            status_code=400,
+        )
+        result = classify_api_error(e, provider="anthropic")
+        assert result.reason == FailoverReason.thinking_signature
+        assert result.retryable is True
+
+    def test_anthropic_thinking_cannot_be_modified_via_openrouter(self):
+        """Same frozen-block error proxied through OpenRouter must also be
+        caught (provider is not gated)."""
+        e = MockAPIError(
+            "`thinking` or `redacted_thinking` blocks in the latest assistant "
+            "message cannot be modified.",
+            status_code=400,
+        )
+        result = classify_api_error(e, provider="openrouter")
+        assert result.reason == FailoverReason.thinking_signature
+        assert result.retryable is True
+
+    def test_400_cannot_be_modified_without_thinking_not_classified(self):
+        """A 400 'cannot be modified' that has nothing to do with thinking
+        blocks must NOT be swept into thinking_signature recovery."""
+        e = MockAPIError(
+            "this field cannot be modified after creation", status_code=400,
+        )
+        result = classify_api_error(e, provider="anthropic", approx_tokens=0)
         assert result.reason != FailoverReason.thinking_signature
 
     def test_invalid_encrypted_content_classified_as_retryable_replay_failure(self):
