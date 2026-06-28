@@ -313,6 +313,34 @@ def _mask_token(token: str) -> str:
     return mask_secret(token, head=6, tail=4, floor=18)
 
 
+# Shell substitutions / variable references are runtime *references*, not literal
+# secrets — masking them corrupts shell syntax (e.g. masking ``$(gh auth token)``
+# to ``***`` drops the ``$(`` opener while leaving a dangling ``)``, producing
+# ``eval: syntax error near unexpected token ')'``). Detect these so header
+# redaction leaves them intact; the actual secret is resolved at exec time and
+# never appears in the static command text.
+#
+# Note: an Authorization-header value containing a space (``bearer $(gh auth
+# token)``) is only partially captured by ``_AUTH_HEADER_RE`` (``\S+`` stops at
+# the first space, capturing just ``$(gh``). So detection keys on the *opening*
+# marker of a substitution/variable, not a balanced match: a literal opaque
+# secret effectively never starts with ``$`` or contains a backtick.
+
+
+def _is_shell_reference(value: str) -> bool:
+    """True if ``value`` is (or begins) a shell substitution/variable reference.
+
+    Masking such a token would break shell syntax, so callers must leave it
+    untouched. Covers ``$(...)``, ``` `...` ``, ``$VAR`` and ``${VAR}`` forms,
+    including the partial capture ``$(gh`` produced when the full reference
+    contains spaces.
+    """
+    if not value:
+        return False
+    v = value.strip()
+    return v.startswith("$") or "`" in v
+
+
 def _redact_query_string(query: str) -> str:
     """Redact sensitive parameter values in a URL query string.
 
@@ -459,7 +487,8 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
     # cheapest substring gate that covers every casing without a casefold().
     if "uthorization" in text or "UTHORIZATION" in text:
         text = _AUTH_HEADER_RE.sub(
-            lambda m: m.group(1) + (m.group(2) or "") + _mask_token(m.group(3)),
+            lambda m: m.group(1) + (m.group(2) or "")
+            + (m.group(3) if _is_shell_reference(m.group(3)) else _mask_token(m.group(3))),
             text,
         )
 
@@ -467,7 +496,8 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
     # colon-separated, so gate on ":" — the regex itself is the precise filter.
     if ":" in text:
         text = _SECRET_HEADER_RE.sub(
-            lambda m: m.group(1) + _mask_token(m.group(2)),
+            lambda m: m.group(1)
+            + (m.group(2) if _is_shell_reference(m.group(2)) else _mask_token(m.group(2))),
             text,
         )
 
