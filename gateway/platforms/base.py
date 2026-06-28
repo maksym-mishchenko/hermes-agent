@@ -1093,8 +1093,6 @@ def _media_delivery_denied_paths() -> List[Path]:
         os.path.join("auth", "google_oauth.json"),
         # Webhook subscription HMAC secrets.
         "webhook_subscriptions.json",
-        # Bitwarden Secrets Manager plaintext disk cache.
-        os.path.join("cache", "bws_cache.json"),
     )
     # Directory trees whose every child is credential material. (MCP OAuth
     # tokens under mcp-tokens/ are handled by the sibling targeted PR #37222;
