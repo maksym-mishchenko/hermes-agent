@@ -165,6 +165,34 @@ def _resolve_restart_drain_timeout() -> float:
         return DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
 
 
+def _count_active_sessions(limit: int = 50, window_seconds: int = 300) -> int:
+    """Count sessions active within ``window_seconds`` from the session store.
+
+    Opens a fresh SQLite connection and runs ``list_sessions_rich`` (a JOIN
+    over ``state.db``), so it performs real filesystem + database I/O.  It MUST
+    be invoked off the event loop — on the single dashboard worker this
+    synchronous read blocks every other connection while the gateway holds the
+    ``state.db`` write lock, which is exactly the stall that pins the loop once
+    the desktop app polls ``/api/status`` alongside its gateway WebSocket.
+    ``get_status`` offloads it via ``asyncio.to_thread`` (which copies the
+    profile contextvar, so ``SessionDB()`` still resolves the
+    ``?profile=``-scoped database).
+    """
+    from hermes_state import SessionDB
+
+    db = SessionDB()
+    try:
+        sessions = db.list_sessions_rich(limit=limit)
+        now = time.time()
+        return sum(
+            1 for s in sessions
+            if s.get("ended_at") is None
+            and (now - s.get("last_active", s.get("started_at", 0))) < window_seconds
+        )
+    finally:
+        db.close()
+
+
 @asynccontextmanager
 async def _lifespan(app: "FastAPI"):
     app.state.event_channels = {}  # dict[str, set]
@@ -2008,18 +2036,15 @@ async def get_status(profile: Optional[str] = None):
 
         active_sessions = 0
         try:
-            from hermes_state import SessionDB
-            db = SessionDB()
-            try:
-                sessions = db.list_sessions_rich(limit=50)
-                now = time.time()
-                active_sessions = sum(
-                    1 for s in sessions
-                    if s.get("ended_at") is None
-                    and (now - s.get("last_active", s.get("started_at", 0))) < 300
-                )
-            finally:
-                db.close()
+            # Offload the SQLite read off the event loop: list_sessions_rich
+            # opens a fresh connection and runs a JOIN over state.db, and on
+            # the single dashboard worker that synchronous I/O stalls every
+            # other connection while the gateway holds the write lock — the
+            # loop-starving bug that surfaced the moment the desktop app polled
+            # /api/status alongside its gateway WebSocket.  asyncio.to_thread
+            # copies the profile contextvar so SessionDB() still resolves the
+            # ?profile=-scoped database.
+            active_sessions = await asyncio.to_thread(_count_active_sessions)
         except Exception:
             pass
 
