@@ -414,6 +414,10 @@ class TelegramAdapter(BasePlatformAdapter):
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
         self._polling_error_task: Optional[asyncio.Task] = None
         self._polling_conflict_count: int = 0
+        # Delayed health-check that resets _polling_conflict_count only after
+        # polling has stayed conflict-free past one long-poll window. Replaced
+        # on every restart and cancelled whenever a fresh conflict arrives.
+        self._polling_conflict_reset_task: Optional[asyncio.Task] = None
         self._polling_network_error_count: int = 0
         self._polling_error_callback_ref = None
         self._polling_heartbeat_task: Optional[asyncio.Task] = None
@@ -1716,13 +1720,28 @@ class TelegramAdapter(BasePlatformAdapter):
         # nor fatal — messages are silently dropped.  We schedule another
         # retry attempt instead of returning silently, and only escalate to
         # fatal after all retries are exhausted.
+        #
+        # The conflict counter must only reset once polling is CONFIRMED
+        # healthy.  start_polling() returning merely means the background
+        # updater task was launched — the 409 surfaces ASYNCHRONOUSLY via the
+        # error callback a few seconds later.  Resetting the counter the moment
+        # start_polling() returns made every cycle reset to 0, so the next async
+        # 409 bumped it back to 1 and the fatal-escalation branch was dead code
+        # (the gateway looped at "1/5" forever).  Instead we schedule a delayed
+        # health-check that resets the counter only if no new conflict arrives
+        # within one long-poll window, and cancel that pending reset here because
+        # this method running at all means a fresh conflict has occurred.
+        if self._polling_conflict_reset_task and not self._polling_conflict_reset_task.done():
+            self._polling_conflict_reset_task.cancel()
+        self._polling_conflict_reset_task = None
+
         self._polling_conflict_count += 1
 
         MAX_CONFLICT_RETRIES = 5
-        # Delay grows with each attempt: 15s, 25s, 35s, 45s, 55s.
-        # Telegram server-side getUpdates sessions typically expire within
-        # 30s; the increasing back-off ensures we clear that window without
-        # hammering the API on fast-restart loops.
+        # Delay grows with each attempt: 20s, 30s, 40s, 50s, 60s
+        # (RETRY_DELAY = 10 + count*10).  Telegram server-side getUpdates
+        # sessions typically expire within 30s; the increasing back-off ensures
+        # we clear that window without hammering the API on fast-restart loops.
         RETRY_DELAY = 10 + (self._polling_conflict_count * 10)  # seconds
 
         if self._polling_conflict_count <= MAX_CONFLICT_RETRIES:
@@ -1733,9 +1752,11 @@ class TelegramAdapter(BasePlatformAdapter):
                 self.name, self._polling_conflict_count, MAX_CONFLICT_RETRIES,
                 RETRY_DELAY, error,
             )
-            # Stop the local updater cleanly before sleeping.  If it's already
-            # stopped (e.g. PTB raised before updater.running was set) this is
-            # a no-op.
+            # Fully stop the local updater before sleeping so the prior
+            # long-poll is drained and awaited — restarting while it is still
+            # alive produces a self-induced 409 against our own getUpdates
+            # session.  PTB's Updater.stop() awaits the polling task; the
+            # running guard avoids the RuntimeError it raises when not running.
             try:
                 if self._app and self._app.updater and self._app.updater.running:
                     await self._app.updater.stop()
@@ -1743,6 +1764,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 pass
 
             await asyncio.sleep(RETRY_DELAY)
+            # Drain (shutdown + re-init) the getUpdates connection pool so the
+            # restarted poller never reuses a half-open socket from the lingering
+            # long-poll.
             await self._drain_polling_connections()
 
             try:
@@ -1752,10 +1776,15 @@ class TelegramAdapter(BasePlatformAdapter):
                     error_callback=self._polling_error_callback_ref,
                 )
                 logger.info(
-                    "[%s] Telegram polling resumed after conflict retry %d/%d",
+                    "[%s] Telegram polling restarted after conflict %d/%d — "
+                    "awaiting a clean poll window before clearing the counter",
                     self.name, self._polling_conflict_count, MAX_CONFLICT_RETRIES,
                 )
-                self._polling_conflict_count = 0  # reset counter on success
+                # Do NOT reset the counter here: start_polling() returning only
+                # launched the updater task; a 409 may still surface
+                # asynchronously.  Schedule a delayed reset that fires only if no
+                # new conflict cancels it within the health window.
+                self._schedule_conflict_reset()
                 return
             except Exception as retry_err:
                 logger.warning(
@@ -1807,6 +1836,40 @@ class TelegramAdapter(BasePlatformAdapter):
                 self.name, stop_error, exc_info=True,
             )
         await self._notify_fatal_error()
+
+    def _schedule_conflict_reset(self) -> None:
+        """Schedule a delayed reset of the polling-conflict counter.
+
+        The counter must only clear once polling is *confirmed* healthy — i.e.
+        a poll window elapses without the error callback re-firing a conflict.
+        We wait ``CONFLICT_HEALTHY_RESET_DELAY`` (comfortably longer than the
+        ~10s long-poll timeout) and then zero the counter, but only if this
+        task was not cancelled by a fresh conflict in the meantime (every
+        ``_handle_polling_conflict`` invocation cancels the pending reset).
+        This avoids busy-waiting while keeping the fatal-escalation safety net
+        live for genuinely repeated conflicts.
+        """
+        CONFLICT_HEALTHY_RESET_DELAY = 35  # seconds, > long-poll timeout (~10s)
+
+        if self._polling_conflict_reset_task and not self._polling_conflict_reset_task.done():
+            self._polling_conflict_reset_task.cancel()
+
+        async def _reset_after_healthy_window() -> None:
+            try:
+                await asyncio.sleep(CONFLICT_HEALTHY_RESET_DELAY)
+            except asyncio.CancelledError:
+                return
+            self._polling_conflict_count = 0
+            logger.info(
+                "[%s] Telegram polling healthy for %ds — conflict counter reset",
+                self.name, CONFLICT_HEALTHY_RESET_DELAY,
+            )
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._polling_conflict_reset_task = loop.create_task(_reset_after_healthy_window())
 
     async def _create_dm_topic(
         self,
@@ -2534,6 +2597,16 @@ class TelegramAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 pass
         self._polling_heartbeat_task = None
+
+        # Cancel any pending conflict-counter reset so it cannot fire against a
+        # torn-down adapter after disconnect.
+        if self._polling_conflict_reset_task and not self._polling_conflict_reset_task.done():
+            self._polling_conflict_reset_task.cancel()
+            try:
+                await self._polling_conflict_reset_task
+            except asyncio.CancelledError:
+                pass
+        self._polling_conflict_reset_task = None
 
         # Mark the bot "Offline" in its short description while the bot's HTTP
         # client is still alive (before app shutdown closes it). Opt-in via
