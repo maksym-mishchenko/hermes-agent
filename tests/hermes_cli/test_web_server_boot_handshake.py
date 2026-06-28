@@ -52,6 +52,14 @@ def _make_slow_drain(seconds: float):
     return _slow
 
 
+def _make_slow_session_count(seconds: float):
+    """Return a _count_active_sessions replacement that sleeps in the caller thread."""
+    def _slow(*_args, **_kwargs):
+        time.sleep(seconds)
+        return 0
+    return _slow
+
+
 # ---------------------------------------------------------------------------
 # Test 1 — _lifespan fire-and-forget does not block the event loop
 # ---------------------------------------------------------------------------
@@ -185,4 +193,78 @@ def test_concurrent_status_probes_all_respond():
     assert not failed, (
         f"{len(failed)}/{PROBES} probes failed (codes: {responses}). "
         f"This would cause WinError 10054 and orphan accumulation on desktop."
+    )
+
+# ---------------------------------------------------------------------------
+# Test 4 — get_status' session read is offloaded, not run on the event loop
+# ---------------------------------------------------------------------------
+
+def test_status_session_count_is_nonblocking():
+    """
+    /api/status counts active sessions via _count_active_sessions, which opens
+    a fresh SQLite connection and runs a JOIN over state.db. On the single
+    dashboard worker that synchronous read must run in a thread, not on the
+    event loop — otherwise it stalls every other connection while the gateway
+    holds the state.db write lock (the loop-starve that appeared when the
+    desktop app polled /api/status alongside its gateway WebSocket).
+
+    Patch _count_active_sessions to sleep in the caller thread, then fire
+    /api/status (which enters the slow read) and a concurrent fast /api/version.
+    We compare *absolute* completion times: with the read offloaded, /api/version
+    finishes ~immediately while /api/status is still waiting out the SLOW_SECONDS
+    sleep in a worker thread, so version finishes well before status. If the read
+    ran on the loop instead, both would unblock together — version could not
+    finish ahead of status. The gap (not raw latency) is what proves the offload.
+    """
+    import httpx
+
+    results: dict[str, float] = {}
+
+    async def _run():
+        transport = httpx.ASGITransport(app=web_server_mod.app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test"
+        ) as client:
+            start = time.perf_counter()
+
+            async with asyncio.TaskGroup() as tg:
+                async def _status():
+                    r = await client.get("/api/status", timeout=SLOW_SECONDS + 5)
+                    results["status_done"] = time.perf_counter() - start
+                    results["status_code"] = r.status_code
+
+                async def _version():
+                    # Small delay so /api/status starts (and enters the slow
+                    # session read) first.
+                    await asyncio.sleep(0.1)
+                    r = await client.get("/api/version", timeout=5)
+                    results["version_done"] = time.perf_counter() - start
+                    results["version_code"] = r.status_code
+
+                tg.create_task(_status())
+                tg.create_task(_version())
+
+    with patch.object(
+        web_server_mod, "_count_active_sessions", _make_slow_session_count(SLOW_SECONDS)
+    ):
+        asyncio.run(_run())
+
+    assert "version_done" in results, "Fast endpoint never responded"
+    assert "status_done" in results, "/api/status never responded"
+
+    version_done = results["version_done"]
+    status_done = results["status_done"]
+
+    # /api/version must finish well before /api/status — i.e. the event loop
+    # stayed free while /api/status' SQLite read ran in a worker thread. If the
+    # read blocked the loop, version could not complete until status did, so the
+    # gap would collapse toward zero. Require at least half of SLOW_SECONDS.
+    assert status_done - version_done > SLOW_SECONDS / 2, (
+        f"/api/version finished at {version_done * 1000:.0f} ms vs /api/status at "
+        f"{status_done * 1000:.0f} ms — the event loop was blocked by /api/status' "
+        f"session read instead of it being offloaded to a worker thread."
+    )
+
+    assert results.get("status_code") == 200, (
+        f"/api/status returned {results.get('status_code')} instead of 200"
     )
