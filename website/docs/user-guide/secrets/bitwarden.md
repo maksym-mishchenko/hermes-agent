@@ -96,7 +96,7 @@ secrets:
 | `access_token_env` | `BWS_ACCESS_TOKEN` | Env var name that holds the bootstrap token. Change this if you already use `BWS_ACCESS_TOKEN` for something else. |
 | `project_id` | `""` | UUID of the project to sync from. |
 | `server_url` | `""` | Bitwarden region or self-hosted endpoint. Empty = `bws` default (US Cloud, `https://vault.bitwarden.com`). Set to `https://vault.bitwarden.eu` for EU Cloud, or your own URL for self-hosted. Plumbed into the `bws` subprocess as `BWS_SERVER_URL`. |
-| `cache_ttl_seconds` | `300` | How long an in-process fetch result is reused. Set to `0` to disable caching. Cache is per-process; new `hermes` invocations start fresh. |
+| `cache_ttl_seconds` | `300` | How long an in-process fetch result is reused. Set to `0` to disable caching. Cache is in-process only — secret values are never written to disk; new `hermes` invocations always fetch fresh values from `bws`. |
 | `override_existing` | `true` | When true, Bitwarden values overwrite anything already in env (so rotation in the web app actually takes effect). Flip to `false` if you want `.env` / shell exports to win locally. |
 | `auto_install` | `true` | When true, `bws` is auto-downloaded into `~/.hermes/bin/` on first use. |
 
