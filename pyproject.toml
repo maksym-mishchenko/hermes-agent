@@ -181,6 +181,14 @@ pty = [
   # without pulling in extra packages.
 ]
 honcho = ["honcho-ai==2.0.1"]
+# Langfuse observability plugin (plugins/observability/langfuse). Optional —
+# the plugin fails open when the SDK is absent, which silently disables ALL
+# agent tracing on a venv rebuild that drops a hand-installed langfuse. v3 is
+# required for `propagate_attributes`. NOTE: langfuse 3.x declares
+# `packaging<26,>=23.2`, but hermes-agent pins `packaging==26.0`; both import
+# fine together at runtime — this is a benign metadata-only conflict. Do NOT
+# "fix" it by downgrading packaging; hermes-agent's pin stays authoritative.
+observability = ["langfuse>=3,<4"]
 # Image resize recovery for the vision tools. Pillow is now a CORE dependency
 # (see the main `dependencies` list) since the byte/pixel shrink paths are on
 # the default vision-embed path and the mid-session lazy install deadlocked the
@@ -291,12 +299,25 @@ all = [
   "hermes-agent[google]",
   "hermes-agent[web]",
   "hermes-agent[youtube]",
+  "hermes-agent[observability]",
 ]
 
 [project.scripts]
 hermes = "hermes_cli.main:main"
 hermes-agent = "run_agent:main"
 hermes-acp = "acp_adapter.entry:main"
+
+[tool.uv]
+# langfuse 3.x (the `observability` extra) declares `packaging<26,>=23.2`, but
+# hermes-agent pins `packaging==26.0` as a core dep. The two import fine
+# together at runtime (langfuse 3.15.0 + packaging 26.0 is the production-proven
+# combo) — langfuse's cap is over-tight metadata, not a real incompatibility.
+# Without this override BOTH pip and uv refuse to resolve `.[observability]`
+# (and therefore `.[all]`) at all, which would turn a silent tracing outage into
+# a hard install failure on every venv rebuild. Overriding `packaging` to the
+# already-pinned 26.0 lets uv accept langfuse while keeping our pin authoritative
+# — do NOT "fix" this by downgrading packaging.
+override-dependencies = ["packaging==26.0"]
 
 [tool.setuptools]
 py-modules = ["run_agent", "model_tools", "toolsets", "batch_runner", "trajectory_compressor", "toolset_distributions", "cli", "hermes_bootstrap", "hermes_constants", "hermes_state", "hermes_time", "hermes_logging", "utils", "mcp_serve"]
