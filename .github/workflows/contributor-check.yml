@@ -6,6 +6,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: contributor-check-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   check-attribution:
     runs-on: ubuntu-latest

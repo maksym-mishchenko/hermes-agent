@@ -6,6 +6,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: docs-site-checks-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   docs-site-checks:
     runs-on: ubuntu-latest
