@@ -15,10 +15,6 @@ permissions:
   contents: read
   actions: write # to trigger deploy-site.yml on schedule
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   build-index:
     # Only run on the upstream repository, not on forks
