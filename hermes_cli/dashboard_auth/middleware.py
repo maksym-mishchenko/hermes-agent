@@ -41,6 +41,8 @@ _GATE_PUBLIC_PREFIXES: tuple[str, ...] = (
     "/auth/password-login",
     "/auth/logout",
     "/login",
+    "/sw.js",
+    "/service-worker.js",
     "/api/auth/providers",
     "/assets/",
     "/favicon.ico",
