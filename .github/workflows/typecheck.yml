@@ -4,6 +4,10 @@ name: Typecheck
 on:
   workflow_call:
 
+concurrency:
+  group: typecheck-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   typecheck:
     name: Check TypeScript

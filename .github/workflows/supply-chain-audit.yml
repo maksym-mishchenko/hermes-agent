@@ -38,6 +38,10 @@ permissions:
   pull-requests: write
   contents: read
 
+concurrency:
+  group: supply-chain-audit-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   scan:
     name: Scan PR for critical supply chain risks
