@@ -13460,6 +13460,53 @@ _mount_plugin_api_routes()
 from hermes_cli.dashboard_auth.routes import router as _dashboard_auth_router  # noqa: E402
 app.include_router(_dashboard_auth_router)
 
+# ---------------------------------------------------------------------------
+# Service-worker kill-switch.  Older Hermes builds registered a service worker
+# that cached the app shell offline-first.  After migrating to the
+# server-rendered login gate, those stale workers keep intercepting requests in
+# already-visited browsers and serve the OLD password gate (which POSTs to the
+# now-dead /api/auth/login).  This route serves a self-destructing worker at
+# the conventional /sw.js (and /service-worker.js) URL: on its next update
+# check the browser installs THIS worker, which clears all caches, unregisters
+# itself, and reloads every controlled tab from the network.  Served publicly
+# (see dashboard_auth.middleware._GATE_PUBLIC_PREFIXES) with no-store so the
+# auth gate never redirects it.
+# ---------------------------------------------------------------------------
+_SW_KILLSWITCH_JS = (
+    "// Hermes service-worker kill-switch (auto-generated, self-destructing).\n"
+    "self.addEventListener('install', function () { self.skipWaiting(); });\n"
+    "self.addEventListener('activate', function (event) {\n"
+    "  event.waitUntil((async function () {\n"
+    "    try {\n"
+    "      var keys = await caches.keys();\n"
+    "      await Promise.all(keys.map(function (k) { return caches.delete(k); }));\n"
+    "    } catch (e) {}\n"
+    "    try { await self.registration.unregister(); } catch (e) {}\n"
+    "    try {\n"
+    "      var cs = await self.clients.matchAll({ type: 'window' });\n"
+    "      for (var i = 0; i < cs.length; i++) {\n"
+    "        try { cs[i].navigate(cs[i].url); } catch (e) {}\n"
+    "      }\n"
+    "    } catch (e) {}\n"
+    "  })());\n"
+    "});\n"
+)
+
+
+@app.get("/sw.js")
+@app.get("/service-worker.js")
+async def _service_worker_killswitch():
+    return Response(
+        content=_SW_KILLSWITCH_JS,
+        media_type="application/javascript",
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Service-Worker-Allowed": "/",
+        },
+    )
+
+
+
 mount_spa(app)
 
 
