@@ -14,7 +14,6 @@ timeout, so the loop is never blocked and a stuck teardown degrades gracefully.
 import asyncio
 import logging
 import threading
-import time
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch

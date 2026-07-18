@@ -5,7 +5,6 @@ from __future__ import annotations
 import base64
 import json
 import os
-import sys
 from typing import Any, Dict, List
 from unittest.mock import MagicMock, patch
 
@@ -2522,7 +2521,7 @@ class TestSessionLifecycle:
         assert args["session"] == backend._session_id
 
     def test_stop_invokes_end_session_before_disconnect(self):
-        from unittest.mock import MagicMock, patch
+        from unittest.mock import MagicMock
         from tools.computer_use.cua_backend import CuaDriverBackend
 
         backend = CuaDriverBackend()

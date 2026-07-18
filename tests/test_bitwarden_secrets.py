@@ -15,7 +15,6 @@ import os
 import stat
 import subprocess
 import sys
-import time
 import zipfile
 from pathlib import Path
 from unittest import mock
