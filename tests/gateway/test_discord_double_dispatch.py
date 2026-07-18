@@ -18,7 +18,7 @@ Two sub-scenarios are tested:
 
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 import sys
 
 import pytest

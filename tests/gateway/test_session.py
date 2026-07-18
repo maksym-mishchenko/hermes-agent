@@ -1057,6 +1057,7 @@ class TestSessionEntryFromDictTraversalValidation:
     }
 
     def _entry(self, **overrides):
+        from gateway.session import SessionEntry
         return {**self.BASE, **overrides}
 
     def test_valid_entry_loads(self):

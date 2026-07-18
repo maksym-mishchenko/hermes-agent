@@ -29,6 +29,7 @@ from __future__ import annotations
 import inspect
 from types import SimpleNamespace
 
+import pytest
 
 from hermes_state import SessionDB
 

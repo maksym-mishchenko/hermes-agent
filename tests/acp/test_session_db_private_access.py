@@ -9,8 +9,11 @@ Verifies that:
 
 import ast
 import json
-from unittest.mock import MagicMock
+import tempfile
+from pathlib import Path
+from unittest.mock import MagicMock, patch, call
 
+import pytest
 
 from hermes_state import SessionDB
 from acp_adapter.session import SessionManager

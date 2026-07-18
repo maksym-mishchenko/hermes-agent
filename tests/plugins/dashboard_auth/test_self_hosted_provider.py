@@ -339,6 +339,7 @@ class TestDiscoveryRealRedirect:
     """
 
     def _serve(self, handler_cls):
+        import http.server
         import socketserver
         import threading
 

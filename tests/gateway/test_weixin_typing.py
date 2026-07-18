@@ -1,5 +1,6 @@
 """Tests for WeChat iLink typing ticket refresh logic (issue #38085)."""
 
+import asyncio
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 

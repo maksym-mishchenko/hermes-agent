@@ -6,9 +6,11 @@ and path-derived key against the enabled/disabled sets.
 """
 
 import json
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
 
 
 # ---------------------------------------------------------------------------

@@ -14,6 +14,7 @@ import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 
 
 def _make_agent(session_db, session_id, *, in_place):

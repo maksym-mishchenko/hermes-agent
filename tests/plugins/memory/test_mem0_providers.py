@@ -1,5 +1,6 @@
 """Tests for OSS provider definitions and validation."""
 
+import pytest
 
 from plugins.memory.mem0._oss_providers import (
     LLM_PROVIDERS,

@@ -12,8 +12,10 @@ Scenarios:
 """
 
 import threading
-from unittest.mock import MagicMock, patch
+import time
+from unittest.mock import MagicMock, PropertyMock, patch
 
+import pytest
 
 # ---------------------------------------------------------------------------
 # Helpers

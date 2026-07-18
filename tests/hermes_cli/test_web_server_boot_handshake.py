@@ -23,8 +23,10 @@ from __future__ import annotations
 
 import asyncio
 import time
+import threading
 from unittest.mock import patch
 
+import pytest
 
 import hermes_cli.web_server as web_server_mod
 
@@ -98,6 +100,7 @@ def test_get_status_does_not_block_event_loop():
     free during the import.
     """
     import httpx
+    from anyio import from_thread, to_thread
 
     results: dict[str, float] = {}
     errors: list[str] = []

@@ -11,6 +11,7 @@ before emitting.
 
 import inspect
 
+import pytest
 
 
 class TestTuiApprovalEmitRedaction:

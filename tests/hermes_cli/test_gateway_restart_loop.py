@@ -7,6 +7,7 @@ Covers:
 """
 
 import json
+import os
 from argparse import Namespace
 
 import pytest

@@ -15,6 +15,7 @@ from hermes_constants import (
     get_default_hermes_root,
     get_hermes_dir,
     get_hermes_home,
+    heal_hermes_managed_node,
     hermes_managed_node_tree_present,
     iter_hermes_node_dirs,
     is_container,

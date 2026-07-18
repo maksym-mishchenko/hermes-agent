@@ -6,6 +6,7 @@ tests pin the config the writers produce and the invariant that the toolset
 resolver + tool-schema builder yield exactly the file/terminal tools.
 """
 
+import pytest
 
 from hermes_cli.setup import (
     _blank_slate_minimal_toolsets,

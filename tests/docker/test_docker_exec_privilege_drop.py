@@ -22,6 +22,7 @@ These tests verify:
 """
 
 from __future__ import annotations
+from tests.docker.conftest import docker_exec
 
 import subprocess
 import time

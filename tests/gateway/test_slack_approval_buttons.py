@@ -1,5 +1,6 @@
 """Tests for Slack Block Kit approval buttons and thread context fetching."""
 
+import asyncio
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch

@@ -11,6 +11,7 @@ Precedence verified here:
 """
 
 import importlib
+import os
 import sys
 import textwrap
 

@@ -1,6 +1,7 @@
 """Tests for plugins/memory/honcho/cli.py."""
 
 from types import SimpleNamespace
+import json
 
 
 class TestResolveApiKey:

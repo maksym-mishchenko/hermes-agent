@@ -11,6 +11,8 @@ import argparse
 import os
 import sys
 import tempfile
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 

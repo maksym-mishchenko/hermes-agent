@@ -6,7 +6,7 @@ isinstance(model, dict)) to silently fail — leaving the provider unset and
 falling back to auto-detection.
 """
 
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 import pytest
 

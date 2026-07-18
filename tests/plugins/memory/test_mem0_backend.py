@@ -1,7 +1,8 @@
 """Tests for Mem0Backend abstraction — PlatformBackend and OSSBackend."""
 
+import pytest
 
-from plugins.memory.mem0._backend import PlatformBackend, OSSBackend
+from plugins.memory.mem0._backend import Mem0Backend, PlatformBackend, OSSBackend
 
 
 class FakePlatformClient:

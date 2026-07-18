@@ -1,5 +1,6 @@
 """Tests for tools/env_probe.py — local Python toolchain probe."""
 
+import sys
 
 import pytest
 

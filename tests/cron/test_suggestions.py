@@ -6,6 +6,7 @@ HERMES_HOME so the real suggestions.json is never touched.
 """
 
 import importlib
+import json
 from pathlib import Path
 from unittest.mock import patch
 
