@@ -477,6 +477,35 @@ class TestPostToolCallHook:
         tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
         assert not tracked_file.exists() or tracked_file.read_text().strip() == "[]"
 
+    def test_post_tool_call_silent_on_permission_error(self, _isolate_env):
+        """Regression: _attempt_track must not propagate PermissionError.
+
+        Production evidence: terminal results containing paths like
+        /root/.hermes/harness2 caused PermissionError to bubble through the
+        post_tool_call hook because p.exists() was outside the try block.
+        Path.exists() propagates PermissionError — it does NOT return False.
+        """
+        from unittest.mock import patch
+
+        pi = _load_plugin_init()
+
+        original_exists = Path.exists
+
+        def raise_for_inaccessible(self):
+            if "/root/" in str(self):
+                raise PermissionError(13, "Permission denied", str(self))
+            return original_exists(self)
+
+        with patch.object(Path, "exists", raise_for_inaccessible):
+            # Must not raise — the hook contract is best-effort, never raises
+            pi._on_post_tool_call(
+                tool_name="terminal",
+                args={"command": "ls /root/.hermes"},
+                result="/root/.hermes/harness2\n/root/.local/share/opencode/auth.json",
+                task_id="t-perm",
+                session_id="s-perm",
+            )
+
 
 class TestOnSessionEndHook:
     def test_runs_quick_when_test_files_tracked(self, _isolate_env):

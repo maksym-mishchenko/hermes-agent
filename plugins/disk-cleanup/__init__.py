@@ -75,14 +75,17 @@ def _attempt_track(path_str: str, task_id: str, session_id: str) -> None:
         p = Path(path_str).expanduser()
     except Exception:
         return
-    if not p.exists():
+    try:
+        if not p.exists():
+            return
+        category = dg.guess_category(p)
+        if category is None:
+            return
+        newly = dg.track(str(p), category, silent=True)
+        if newly:
+            _record_track(task_id, session_id, p, category)
+    except OSError:
         return
-    category = dg.guess_category(p)
-    if category is None:
-        return
-    newly = dg.track(str(p), category, silent=True)
-    if newly:
-        _record_track(task_id, session_id, p, category)
 
 
 def _extract_paths_from_write_file(args: Dict[str, Any]) -> Set[str]:
