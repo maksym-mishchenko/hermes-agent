@@ -923,6 +923,90 @@ class TestScopedLocks:
         assert payload["pid"] == os.getpid()
         assert payload["metadata"]["platform"] == "telegram"
 
+    # ---- supplemental flock tests (POSIX-only, subprocess probe) ----------
+
+    def test_external_process_flock_blocked_while_hermes_owns_scoped_lock(
+        self, tmp_path, monkeypatch
+    ):
+        """A nonblocking flock from a child process must fail while this
+        process holds the scoped lock (supplemental POSIX flock).
+        """
+        import subprocess
+        import sys
+
+        pytest = __import__("pytest")
+        if sys.platform == "win32":
+            pytest.skip("POSIX flock only")
+
+        monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "locks"))
+        acquired, _ = status.acquire_scoped_lock("telegram", "tok")
+        assert acquired is True
+
+        lock_dir = tmp_path / "locks"
+        lock_files = list(lock_dir.glob("*.lock"))
+        assert lock_files, "Lock file was not created"
+        lock_path = str(lock_files[0])
+
+        script = (
+            "import fcntl, sys\n"
+            f"fh = open({lock_path!r}, 'r+')\n"
+            "try:\n"
+            "    fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+            "    fh.close(); sys.exit(0)\n"
+            "except OSError:\n"
+            "    fh.close(); sys.exit(1)\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script], timeout=5, check=False
+        )
+        assert result.returncode == 1, (
+            "External process should be blocked from flocking while Hermes holds the scoped lock"
+        )
+
+    def test_external_process_flock_succeeds_after_release(
+        self, tmp_path, monkeypatch
+    ):
+        """A nonblocking flock from a child process must succeed once this
+        process has released the scoped lock.
+        """
+        import subprocess
+        import sys
+
+        pytest = __import__("pytest")
+        if sys.platform == "win32":
+            pytest.skip("POSIX flock only")
+
+        monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "locks"))
+        acquired, _ = status.acquire_scoped_lock("telegram", "tok")
+        assert acquired is True
+
+        lock_dir = tmp_path / "locks"
+        lock_path = list(lock_dir.glob("*.lock"))[0]
+
+        status.release_scoped_lock("telegram", "tok")
+        assert not lock_path.exists(), "Lock file should be removed after release"
+
+        # Re-create a file at the same path so the subprocess has something to open.
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_text("{}")
+        lock_path_str = str(lock_path)
+
+        script = (
+            "import fcntl, sys\n"
+            f"fh = open({lock_path_str!r}, 'r+')\n"
+            "try:\n"
+            "    fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+            "    fh.close(); sys.exit(0)\n"
+            "except OSError:\n"
+            "    fh.close(); sys.exit(1)\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script], timeout=5, check=False
+        )
+        assert result.returncode == 0, (
+            "External process should be able to flock after Hermes releases the scoped lock"
+        )
+
 
 class TestTakeoverMarker:
     """Tests for the --replace takeover marker.

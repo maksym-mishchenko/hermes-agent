@@ -36,6 +36,9 @@ _IS_WINDOWS = sys.platform == "win32"
 _UNSET = object()
 _GATEWAY_LOCK_FILENAME = "gateway.lock"
 _gateway_lock_handle = None
+# Per-scope supplemental flock handles held for the full ownership lifetime.
+# Keyed by the absolute lock-file Path; values are open file objects.
+_scope_lock_handles: dict = {}
 # Windows byte-range locks are mandatory for other readers. Lock a byte well
 # past the JSON payload so runtime status / PID readers can still read the file
 # while another process holds the mutual-exclusion lock.
@@ -608,6 +611,54 @@ def _release_file_lock(handle) -> None:
         pass
 
 
+def _acquire_scope_flock(lock_path: Path) -> bool:
+    """Open *lock_path* and hold a POSIX exclusive flock for the process lifetime.
+
+    Must be called after writing the PID record so the file exists.
+    Idempotent: returns True immediately when a handle is already stored.
+    Returns False (fail closed) on any OS error; never logs the lock path.
+    No-op on Windows (returns True): O_CREAT|O_EXCL semantics are sufficient there.
+    """
+    if _IS_WINDOWS:
+        return True
+    if lock_path in _scope_lock_handles:
+        return True
+    try:
+        handle = open(lock_path, "r+", encoding="utf-8")
+    except OSError:
+        return False
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (BlockingIOError, OSError):
+        try:
+            handle.close()
+        except OSError:
+            pass
+        return False
+    _scope_lock_handles[lock_path] = handle
+    return True
+
+
+def _release_scope_flock(lock_path: Path) -> None:
+    """Release and close the supplemental POSIX flock for *lock_path*.
+
+    Safe no-op when no handle is held for *lock_path* or on Windows.
+    """
+    if _IS_WINDOWS:
+        return
+    handle = _scope_lock_handles.pop(lock_path, None)
+    if handle is None:
+        return
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        handle.close()
+    except OSError:
+        pass
+
+
 def acquire_gateway_runtime_lock() -> bool:
     """Claim the cross-process runtime lock for the gateway.
 
@@ -913,6 +964,12 @@ def acquire_scoped_lock(scope: str, identity: str, metadata: Optional[dict[str, 
 
         if existing_pid == os.getpid() and existing.get("start_time") == record.get("start_time"):
             _write_json_file(lock_path, record)
+            if not _acquire_scope_flock(lock_path):
+                try:
+                    lock_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                return False, None
             return True, existing
 
         stale = existing_pid is None
@@ -994,6 +1051,12 @@ def acquire_scoped_lock(scope: str, identity: str, metadata: Optional[dict[str, 
         except OSError:
             pass
         raise
+    if not _acquire_scope_flock(lock_path):
+        try:
+            lock_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False, None
     return True, None
 
 
@@ -1007,6 +1070,7 @@ def release_scoped_lock(scope: str, identity: str) -> None:
         return
     if existing.get("start_time") != _get_process_start_time(os.getpid()):
         return
+    _release_scope_flock(lock_path)
     try:
         lock_path.unlink(missing_ok=True)
     except OSError:
@@ -1051,6 +1115,7 @@ def release_all_scoped_locks(
                 ):
                     continue
             try:
+                _release_scope_flock(lock_file)
                 lock_file.unlink(missing_ok=True)
                 removed += 1
             except OSError:
