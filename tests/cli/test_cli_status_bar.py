@@ -400,13 +400,18 @@ class TestCLIStatusBar:
         cli_obj = _make_cli()
         cli_obj._spinner_text = "running tool"
 
-        # <60s path
-        cli_obj._tool_start_time = time.monotonic() - 9.2
-        short = cli_obj._render_spinner_text()
+        # Pin monotonic to a fixed large value so synthetic start times are
+        # always positive regardless of how recently the OS booted.
+        _FAKE_NOW = 10_000.0
 
-        # >=60s path
-        cli_obj._tool_start_time = time.monotonic() - 65.2
-        long = cli_obj._render_spinner_text()
+        with patch("cli.time.monotonic", return_value=_FAKE_NOW):
+            # <60s path
+            cli_obj._tool_start_time = _FAKE_NOW - 9.2
+            short = cli_obj._render_spinner_text()
+
+            # >=60s path
+            cli_obj._tool_start_time = _FAKE_NOW - 65.2
+            long = cli_obj._render_spinner_text()
 
         short_elapsed = short.split("(", 1)[1].rstrip(")")
         long_elapsed = long.split("(", 1)[1].rstrip(")")
