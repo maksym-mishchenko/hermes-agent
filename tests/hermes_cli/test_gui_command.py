@@ -70,11 +70,57 @@ def test_gui_installs_packages_and_launches_desktop_app(tmp_path, monkeypatch):
         cli_main.cmd_gui(_ns())
 
     assert exc.value.code == 0
-    mock_install.assert_called_once_with("/usr/bin/npm", root, capture_output=False, env=None)
+    # The install now runs with a resolved env (managed-Node PATH), never a bare
+    # ``env=None`` that would leave npm's child scripts unable to find ``node``.
+    mock_install.assert_called_once()
+    assert mock_install.call_args.args == ("/usr/bin/npm", root)
+    assert mock_install.call_args.kwargs["capture_output"] is False
+    install_env = mock_install.call_args.kwargs["env"]
+    assert install_env is not None and "PATH" in install_env
     assert mock_run.call_args_list[0].args[0] == ["/usr/bin/npm", "run", "pack"]
     assert mock_run.call_args_list[0].kwargs["cwd"] == desktop_dir
     assert mock_run.call_args_list[1].args[0] == [str(packaged_exe)]
     assert mock_run.call_args_list[1].kwargs["cwd"] == desktop_dir
+
+
+def test_gui_install_env_prepends_managed_node_on_bare_path(tmp_path, monkeypatch):
+    """Regression: npm's child scripts (electron-winstaller's select-7z-arch.js)
+    shell out to bare ``node``. When Desktop is launched from the updater chain
+    the parent PATH is stripped, so the install env MUST carry the Hermes-managed
+    Node ahead of that bare PATH or the install dies with ``node: not found``.
+    """
+    import os
+
+    from hermes_constants import iter_hermes_node_dirs
+
+    root = _make_desktop_tree(tmp_path)
+    monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
+    _make_packaged_executable(root, monkeypatch, platform="win32")
+
+    # A managed Node tree on disk so with_hermes_node_path() actually prepends it.
+    home = tmp_path / "hermes-home"
+    (home / "node" / "bin").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    # Simulate the stripped PATH the desktop updater chain hands us.
+    monkeypatch.setenv("PATH", os.pathsep.join(["/usr/bin", "/bin"]))
+
+    install_ok = subprocess.CompletedProcess(["npm", "ci"], 0)
+    launch_ok = subprocess.CompletedProcess(["hermes"], 0)
+
+    with patch("hermes_cli.main._resolve_node_runtime_npm", return_value="/usr/bin/npm"), \
+         patch("hermes_cli.main._run_npm_install_deterministic", return_value=install_ok) as mock_install, \
+         patch("hermes_cli.main._desktop_build_needed", return_value=True), \
+         patch("hermes_cli.main._write_desktop_build_stamp"), \
+         patch("hermes_cli.main.subprocess.run", side_effect=[subprocess.CompletedProcess([], 0), launch_ok]), \
+         pytest.raises(SystemExit):
+        cli_main.cmd_gui(_ns(skip_build=False))
+
+    managed_dirs = [str(p) for p in iter_hermes_node_dirs() if p.is_dir()]
+    assert managed_dirs, "managed node tree not discovered"
+    install_env = mock_install.call_args.kwargs["env"]
+    path_parts = install_env["PATH"].split(os.pathsep)
+    assert path_parts[: len(managed_dirs)] == managed_dirs
+    assert "/usr/bin" in path_parts  # the bare updater PATH is preserved, just after managed Node
 
 
 def test_gui_forwards_desktop_environment_overrides(tmp_path, monkeypatch):
@@ -220,6 +266,41 @@ def test_gui_linux_skips_fixup_when_already_configured(tmp_path, monkeypatch):
     # Only the launch call — no sudo chown/chmod
     mock_run.assert_called_once()
     assert mock_run.call_args.args[0] == [str(packaged_exe)]
+
+
+def test_gui_linux_falls_back_to_no_sandbox_when_userns_is_restricted(tmp_path, monkeypatch):
+    root = _make_desktop_tree(tmp_path)
+    monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
+    packaged_exe = _make_packaged_executable(root, monkeypatch, platform="linux")
+    sandbox = packaged_exe.parent / "chrome-sandbox"
+    sandbox.write_text("", encoding="utf-8")
+
+    launch_ok = subprocess.CompletedProcess([str(packaged_exe), "--no-sandbox"], 0)
+
+    with patch("hermes_cli.main._desktop_linux_sandbox_fixup", return_value=False), \
+         patch("hermes_cli.main._desktop_linux_needs_no_sandbox", return_value=True), \
+         patch("hermes_cli.main.subprocess.run", return_value=launch_ok) as mock_run, \
+         pytest.raises(SystemExit) as exc:
+        cli_main.cmd_gui(_ns(skip_build=True))
+
+    assert exc.value.code == 0
+    mock_run.assert_called_once()
+    assert mock_run.call_args.args[0] == [str(packaged_exe), "--no-sandbox"]
+
+
+def test_gui_linux_exits_when_sandbox_fixup_fails_without_safe_fallback(tmp_path, monkeypatch):
+    root = _make_desktop_tree(tmp_path)
+    monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
+    _make_packaged_executable(root, monkeypatch, platform="linux")
+
+    with patch("hermes_cli.main._desktop_linux_sandbox_fixup", return_value=False), \
+         patch("hermes_cli.main._desktop_linux_needs_no_sandbox", return_value=False), \
+         patch("hermes_cli.main.subprocess.run") as mock_run, \
+         pytest.raises(SystemExit) as exc:
+        cli_main.cmd_gui(_ns(skip_build=True))
+
+    assert exc.value.code == 1
+    mock_run.assert_not_called()
 
 
 def test_gui_source_mode_uses_renderer_build_and_electron(tmp_path, monkeypatch):
@@ -971,3 +1052,53 @@ def test_force_adhoc_signing_respects_explicit_caller_flag(monkeypatch):
     env = {"CSC_IDENTITY_AUTO_DISCOVERY": "true"}
     assert cli_main._force_adhoc_macos_signing(env, source_mode=False) is False
     assert env["CSC_IDENTITY_AUTO_DISCOVERY"] == "true"
+
+
+# --- desktop.* launch options (config.yaml) -------------------------------
+
+
+def test_desktop_launch_options_defaults_when_no_config():
+    with patch("hermes_cli.config.load_config", return_value={}):
+        flags, gpu = cli_main._desktop_launch_options()
+    assert flags == []
+    assert gpu == "auto"
+
+
+def test_desktop_launch_options_reads_flags_list():
+    cfg = {"desktop": {"electron_flags": ["--ozone-platform=x11", "--disable-gpu"]}}
+    with patch("hermes_cli.config.load_config", return_value=cfg):
+        flags, gpu = cli_main._desktop_launch_options()
+    assert flags == ["--ozone-platform=x11", "--disable-gpu"]
+    assert gpu == "auto"
+
+
+def test_desktop_launch_options_splits_flag_string():
+    cfg = {"desktop": {"electron_flags": "--ozone-platform=x11 --disable-gpu"}}
+    with patch("hermes_cli.config.load_config", return_value=cfg):
+        flags, _ = cli_main._desktop_launch_options()
+    assert flags == ["--ozone-platform=x11", "--disable-gpu"]
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        (True, "1"),
+        (False, "0"),
+        ("true", "1"),
+        ("off", "0"),
+        ("auto", "auto"),
+        ("garbage", "auto"),
+    ],
+)
+def test_desktop_launch_options_normalizes_disable_gpu(raw, expected):
+    cfg = {"desktop": {"disable_gpu": raw}}
+    with patch("hermes_cli.config.load_config", return_value=cfg):
+        _, gpu = cli_main._desktop_launch_options()
+    assert gpu == expected
+
+
+def test_desktop_launch_options_survives_config_error():
+    with patch("hermes_cli.config.load_config", side_effect=RuntimeError("boom")):
+        flags, gpu = cli_main._desktop_launch_options()
+    assert flags == []
+    assert gpu == "auto"
