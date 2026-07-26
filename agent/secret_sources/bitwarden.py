@@ -46,6 +46,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from agent.secret_sources.base import (
+    ErrorKind,
+    FetchResult as SourceFetchResult,
+    SecretSource,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -573,6 +579,157 @@ def apply_bitwarden_secrets(
         result.applied.append(key)
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# SecretSource adapter — the registry-facing wrapper around this module.
+# ---------------------------------------------------------------------------
+
+
+def _classify_bws_error(message: str) -> ErrorKind:
+    """Map bws failures onto the shared secret-source error taxonomy."""
+    lowered = message.lower()
+    if "timed out" in lowered:
+        return ErrorKind.TIMEOUT
+    if any(
+        token in lowered
+        for token in (
+            "not available",
+            "auto-install failed",
+            "install manually",
+            "failed to invoke",
+        )
+    ):
+        return ErrorKind.BINARY_MISSING
+    if any(
+        token in lowered
+        for token in (
+            "unauthorized",
+            "invalid_client",
+            "authentication",
+            "401",
+            "403",
+        )
+    ):
+        return ErrorKind.AUTH_FAILED
+    if any(
+        token in lowered
+        for token in ("network", "connection", "resolve host", "dns")
+    ):
+        return ErrorKind.NETWORK
+    return ErrorKind.INTERNAL
+
+
+class BitwardenSource(SecretSource):
+    """Bitwarden Secrets Manager adapter for the secret-source registry."""
+
+    name = "bitwarden"
+    label = "Bitwarden Secrets Manager"
+    shape = "bulk"
+    scheme = "bws"
+
+    def override_existing(self, cfg: dict) -> bool:
+        """Return whether BSM values should overwrite shell or .env values."""
+        return bool(
+            isinstance(cfg, dict) and cfg.get("override_existing", True)
+        )
+
+    def protected_env_vars(self, cfg: dict):
+        """Protect the bootstrap token from being overwritten by fetched data."""
+        token_env = "BWS_ACCESS_TOKEN"
+        if isinstance(cfg, dict):
+            token_env = str(cfg.get("access_token_env") or token_env)
+        return frozenset({token_env})
+
+    def config_schema(self) -> dict:
+        """Describe the supported config keys for setup and status flows."""
+        return {
+            "enabled": {"description": "Master switch", "default": False},
+            "access_token_env": {
+                "description": "Env var holding the access token",
+                "default": "BWS_ACCESS_TOKEN",
+            },
+            "project_id": {
+                "description": "Bitwarden Secrets Manager project UUID",
+                "default": "",
+            },
+            "cache_ttl_seconds": {
+                "description": "Fresh in-process cache TTL; 0 disables reuse",
+                "default": 300,
+            },
+            "override_existing": {
+                "description": "Resolved values overwrite .env/shell values",
+                "default": True,
+            },
+            "auto_install": {
+                "description": "Auto-download the pinned bws binary",
+                "default": True,
+            },
+            "server_url": {
+                "description": "Region or self-hosted endpoint",
+                "default": "",
+            },
+        }
+
+    def fetch(self, cfg: dict, home_path: Path) -> SourceFetchResult:
+        """Fetch Bitwarden secrets without mutating os.environ directly."""
+        cfg = cfg if isinstance(cfg, dict) else {}
+        result = SourceFetchResult()
+
+        access_token_env = str(cfg.get("access_token_env") or "BWS_ACCESS_TOKEN")
+        access_token = os.environ.get(access_token_env, "").strip()
+        if not access_token:
+            result.error = (
+                f"secrets.bitwarden.enabled is true but {access_token_env} is "
+                "not set.  Run `hermes secrets bitwarden setup`."
+            )
+            result.error_kind = ErrorKind.NOT_CONFIGURED
+            return result
+
+        project_id = str(cfg.get("project_id") or "")
+        if not project_id:
+            result.error = (
+                "secrets.bitwarden.project_id is empty.  "
+                "Run `hermes secrets bitwarden setup`."
+            )
+            result.error_kind = ErrorKind.NOT_CONFIGURED
+            return result
+
+        binary = find_bws(
+            install_if_missing=bool(cfg.get("auto_install", True))
+        )
+        result.binary_path = binary
+        if binary is None:
+            result.error = (
+                "bws binary not available and auto-install is disabled.  "
+                "Run `hermes secrets bitwarden setup` to install."
+            )
+            result.error_kind = ErrorKind.BINARY_MISSING
+            return result
+
+        server_url = str(cfg.get("server_url") or "").strip()
+        try:
+            ttl = float(cfg.get("cache_ttl_seconds", 300))
+        except (TypeError, ValueError):
+            ttl = 300.0
+
+        try:
+            secrets, warnings = fetch_bitwarden_secrets(
+                access_token=access_token,
+                project_id=project_id,
+                binary=binary,
+                cache_ttl_seconds=ttl,
+                server_url=server_url,
+                home_path=home_path,
+            )
+        except RuntimeError as exc:
+            result.error = str(exc)
+            result.error_kind = _classify_bws_error(str(exc))
+            return result
+
+        result.secrets = secrets
+        result.warnings.extend(warnings)
+        return result
 
 
 # ---------------------------------------------------------------------------

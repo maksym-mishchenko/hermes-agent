@@ -53,7 +53,7 @@ def _make_slow_drain(seconds: float):
 
 
 def _make_slow_session_count(seconds: float):
-    """Return a _count_active_sessions replacement that sleeps in the caller thread."""
+    """Return a slow _count_status_active_sessions replacement."""
     def _slow(*_args, **_kwargs):
         time.sleep(seconds)
         return 0
@@ -201,20 +201,21 @@ def test_concurrent_status_probes_all_respond():
 
 def test_status_session_count_is_nonblocking():
     """
-    /api/status counts active sessions via _count_active_sessions, which opens
+    /api/status counts active sessions via _count_status_active_sessions, which opens
     a fresh SQLite connection and runs a JOIN over state.db. On the single
     dashboard worker that synchronous read must run in a thread, not on the
     event loop — otherwise it stalls every other connection while the gateway
     holds the state.db write lock (the loop-starve that appeared when the
     desktop app polled /api/status alongside its gateway WebSocket).
 
-    Patch _count_active_sessions to sleep in the caller thread, then fire
-    /api/status (which enters the slow read) and a concurrent fast /api/version.
-    We compare *absolute* completion times: with the read offloaded, /api/version
-    finishes ~immediately while /api/status is still waiting out the SLOW_SECONDS
-    sleep in a worker thread, so version finishes well before status. If the read
-    ran on the loop instead, both would unblock together — version could not
-    finish ahead of status. The gap (not raw latency) is what proves the offload.
+    Patch _count_status_active_sessions to sleep in the caller thread, then
+    fire /api/status (which enters the slow read) and a concurrent fast
+    /api/version. _status_active_sessions times out the worker after
+    _STATUS_ACTIVE_SESSIONS_TIMEOUT, so /api/status should finish only after
+    that timeout window elapses while /api/version still returns promptly.
+    If the read ran on the loop instead, both would unblock together —
+    version could not finish ahead of status. The gap (not raw latency) is
+    what proves the offload.
     """
     import httpx
 
@@ -245,7 +246,9 @@ def test_status_session_count_is_nonblocking():
                 tg.create_task(_version())
 
     with patch.object(
-        web_server_mod, "_count_active_sessions", _make_slow_session_count(SLOW_SECONDS)
+        web_server_mod,
+        "_count_status_active_sessions",
+        _make_slow_session_count(SLOW_SECONDS),
     ):
         asyncio.run(_run())
 
@@ -258,8 +261,11 @@ def test_status_session_count_is_nonblocking():
     # /api/version must finish well before /api/status — i.e. the event loop
     # stayed free while /api/status' SQLite read ran in a worker thread. If the
     # read blocked the loop, version could not complete until status did, so the
-    # gap would collapse toward zero. Require at least half of SLOW_SECONDS.
-    assert status_done - version_done > SLOW_SECONDS / 2, (
+    # gap would collapse toward zero. Because /api/status caps the wait with
+    # _STATUS_ACTIVE_SESSIONS_TIMEOUT, require a meaningful fraction of that
+    # configured timeout instead of half of the injected sleep.
+    min_gap = web_server_mod._STATUS_ACTIVE_SESSIONS_TIMEOUT / 2
+    assert status_done - version_done > min_gap, (
         f"/api/version finished at {version_done * 1000:.0f} ms vs /api/status at "
         f"{status_done * 1000:.0f} ms — the event loop was blocked by /api/status' "
         f"session read instead of it being offloaded to a worker thread."
