@@ -773,3 +773,127 @@ def test_severity_at_or_above_uses_threshold_semantics():
     assert kd.severity_at_or_above("error", "critical") is False
     assert kd.severity_at_or_above("mystery", "warning") is False
     assert kd.severity_at_or_above("warning", None) is True
+
+
+# ---------------------------------------------------------------------------
+# running_with_stale_heartbeat  (worker-spawn stall observability)
+# ---------------------------------------------------------------------------
+
+
+def test_running_stale_heartbeat_fires_above_threshold():
+    """A running task with claim_lock whose heartbeat is older than the
+    default 1h threshold should produce a warning diagnostic."""
+    now = 200_000
+    threshold = 60 * 60  # 1h default
+    last_hb = now - threshold - 60  # just over threshold
+    task = _task(
+        status="running",
+        claim_lock="run_abc",
+        last_heartbeat_at=last_hb,
+    )
+    diags = kd.compute_task_diagnostics(task, [], [], now=now)
+    stall = [d for d in diags if d.kind == "running_with_stale_heartbeat"]
+    assert len(stall) == 1
+    assert stall[0].severity == "warning"
+    assert stall[0].data["stale_seconds"] == now - last_hb
+    assert stall[0].data["threshold_seconds"] == threshold
+
+
+def test_running_stale_heartbeat_silent_below_threshold():
+    """Fresh heartbeat 10 min ago — no diagnostic should fire."""
+    now = 200_000
+    task = _task(
+        status="running",
+        claim_lock="run_abc",
+        last_heartbeat_at=now - 10 * 60,
+    )
+    diags = kd.compute_task_diagnostics(task, [], [], now=now)
+    assert [d for d in diags if d.kind == "running_with_stale_heartbeat"] == []
+
+
+def test_running_stale_heartbeat_silent_without_heartbeat_data():
+    """No heartbeat ever recorded (None) — silent to avoid false positives
+    on freshly-spawned workers that haven't had time to check in yet."""
+    now = 200_000
+    task = _task(
+        status="running",
+        claim_lock="run_abc",
+        last_heartbeat_at=None,
+    )
+    diags = kd.compute_task_diagnostics(task, [], [], now=now)
+    assert [d for d in diags if d.kind == "running_with_stale_heartbeat"] == []
+
+
+def test_running_stale_heartbeat_silent_non_running_status():
+    """Rule is scoped to running status only."""
+    now = 200_000
+    stale_hb = now - 3 * 3600
+    for status in ("ready", "blocked", "done", "todo", "triage"):
+        task = _task(
+            status=status,
+            claim_lock=None,
+            last_heartbeat_at=stale_hb,
+        )
+        diags = kd.compute_task_diagnostics(task, [], [], now=now)
+        assert [d for d in diags if d.kind == "running_with_stale_heartbeat"] == [], status
+
+
+def test_running_stale_heartbeat_silent_without_claim_lock():
+    """No claim_lock means the task isn't actively claimed — suppress."""
+    now = 200_000
+    task = _task(
+        status="running",
+        claim_lock=None,
+        last_heartbeat_at=now - 3 * 3600,
+    )
+    diags = kd.compute_task_diagnostics(task, [], [], now=now)
+    assert [d for d in diags if d.kind == "running_with_stale_heartbeat"] == []
+
+
+def test_running_stale_heartbeat_severity_escalates():
+    """warning → error → critical at 2x and 4x threshold."""
+    now = 200_000
+    threshold = 60 * 60  # 1h default
+    cases = [
+        (threshold + 1, "warning"),         # just over — warning
+        (threshold * 2 + 1, "error"),       # 2x+ — error
+        (threshold * 4 + 1, "critical"),    # 4x+ — critical
+    ]
+    for stale_secs, expected in cases:
+        task = _task(
+            status="running",
+            claim_lock="run_abc",
+            last_heartbeat_at=now - stale_secs,
+        )
+        diags = kd.compute_task_diagnostics(task, [], [], now=now)
+        stall = [d for d in diags if d.kind == "running_with_stale_heartbeat"]
+        assert len(stall) == 1, f"expected 1 for stale_secs={stale_secs}"
+        assert stall[0].severity == expected, f"stale={stale_secs}: {stall[0].severity!r} != {expected!r}"
+
+
+def test_running_stale_heartbeat_custom_threshold():
+    """cfg["heartbeat_stale_seconds"] overrides the default threshold."""
+    now = 200_000
+    custom_threshold = 30 * 60  # 30 min
+    last_hb = now - 35 * 60    # 35 min ago — over custom but under default 1h
+    task = _task(
+        status="running",
+        claim_lock="run_abc",
+        last_heartbeat_at=last_hb,
+    )
+    cfg = {"heartbeat_stale_seconds": custom_threshold}
+    diags = kd.compute_task_diagnostics(task, [], [], now=now, config=cfg)
+    stall = [d for d in diags if d.kind == "running_with_stale_heartbeat"]
+    assert len(stall) == 1
+    assert stall[0].data["threshold_seconds"] == custom_threshold
+
+
+def test_running_with_stale_heartbeat_in_diagnostic_kinds():
+    """DIAGNOSTIC_KINDS tuple must include the new kind."""
+    assert "running_with_stale_heartbeat" in kd.DIAGNOSTIC_KINDS
+
+
+def test_running_with_stale_heartbeat_in_default_config():
+    """DEFAULT_CONFIG must declare the threshold key."""
+    assert "heartbeat_stale_seconds" in kd.DEFAULT_CONFIG
+    assert kd.DEFAULT_CONFIG["heartbeat_stale_seconds"] == 60 * 60
