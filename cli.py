@@ -1899,6 +1899,16 @@ def _run_state_db_auto_maintenance(session_db) -> None:
 
         cfg = (_load_full_config().get("sessions") or {})
         if not cfg.get("auto_prune", False):
+            # Emit a one-time advisory when retention_days is configured but
+            # auto_prune is not enabled — prevents silent enforcement gap.
+            if cfg.get("retention_days", 90) != 90:
+                logger.info(
+                    "state.db retention policy: retention_days=%d is set but "
+                    "sessions.auto_prune=false — old sessions will NOT be pruned "
+                    "automatically.  Set sessions.auto_prune: true in config.yaml "
+                    "to enforce the retention policy.",
+                    cfg.get("retention_days", 90),
+                )
             return
         session_db.maybe_auto_prune_and_vacuum(
             retention_days=int(cfg.get("retention_days", 90)),
