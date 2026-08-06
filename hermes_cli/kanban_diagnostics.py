@@ -1000,6 +1000,95 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     )]
 
 
+def _rule_running_with_stale_heartbeat(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """Running task whose worker has stopped sending heartbeats.
+
+    A task is in ``running`` state with an active claim_lock but its
+    ``last_heartbeat_at`` has not been updated for longer than
+    ``cfg["heartbeat_stale_seconds"]`` (default 3600 = 1h, matching
+    ``kanban_db.DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS``).
+
+    This is the observable marker of the "worker-spawn stall" audit finding:
+    the dispatcher spawned a worker successfully (no spawn_failure events)
+    but the worker stalled silently — neither completing nor updating its
+    heartbeat.  The claim TTL will eventually reclaim it, but operators
+    have no visibility into why the task appears frozen.
+
+    The rule fires only when heartbeat data is present in the task row
+    (``last_heartbeat_at`` is not None) — tasks that never sent a single
+    heartbeat are indistinguishable from tasks that haven't had time to
+    start, so we suppress the diagnostic there to avoid false positives.
+    """
+    if _task_field(task, "status") != "running":
+        return []
+    if not _task_field(task, "claim_lock"):
+        return []
+
+    last_hb = _task_field(task, "last_heartbeat_at")
+    if last_hb is None:
+        # No heartbeat ever recorded — cannot distinguish "just started"
+        # from "stalled before first heartbeat".  Stay silent.
+        return []
+
+    try:
+        last_hb_ts = int(last_hb)
+    except (TypeError, ValueError):
+        return []
+
+    threshold = float(cfg.get("heartbeat_stale_seconds", 60 * 60))
+    stale_secs = now - last_hb_ts
+    if stale_secs < threshold:
+        return []
+
+    if stale_secs >= threshold * 4:
+        severity = "critical"
+    elif stale_secs >= threshold * 2:
+        severity = "error"
+    else:
+        severity = "warning"
+
+    if stale_secs >= 3600:
+        stale_str = f"{stale_secs / 3600:.1f}h"
+    else:
+        stale_str = f"{int(stale_secs / 60)}m"
+
+    task_id = _task_field(task, "id") or _task_field(task, "task_id") or "?"
+    actions = [
+        DiagnosticAction(
+            kind="reclaim",
+            label="Reclaim stalled task",
+            payload={"reclaim_first": True},
+        ),
+        DiagnosticAction(
+            kind="cli_hint",
+            label="Reclaim via CLI",
+            payload={"command": f"hermes kanban reclaim {task_id}"},
+        ),
+    ]
+
+    return [Diagnostic(
+        kind="running_with_stale_heartbeat",
+        severity=severity,
+        title=f"Worker silent for {stale_str}",
+        detail=(
+            f"This task is claimed and running but the worker has not sent "
+            f"a heartbeat in {stale_str}.  The worker may have stalled, "
+            f"crashed silently, or been killed.  The dispatcher will "
+            f"auto-reclaim after the claim TTL expires, but you can "
+            f"reclaim now to make it available for retry immediately."
+        ),
+        actions=actions,
+        first_seen_at=last_hb_ts,
+        last_seen_at=last_hb_ts,
+        count=1,
+        data={
+            "last_heartbeat_at": last_hb_ts,
+            "stale_seconds": int(stale_secs),
+            "threshold_seconds": int(threshold),
+        },
+    )]
+
+
 # Registry — order matters: rules higher on the list render first when
 # severity ties. Add new rules here.
 _RULES: list[RuleFn] = [
@@ -1011,6 +1100,7 @@ _RULES: list[RuleFn] = [
     _rule_stuck_in_blocked,
     _rule_block_unblock_cycling,
     _rule_stranded_in_ready,
+    _rule_running_with_stale_heartbeat,
 ]
 
 
@@ -1025,6 +1115,7 @@ DIAGNOSTIC_KINDS = (
     "stuck_in_blocked",
     "block_unblock_cycling",
     "stranded_in_ready",
+    "running_with_stale_heartbeat",
 )
 
 
@@ -1040,6 +1131,11 @@ DEFAULT_CONFIG = {
     # signal is dominated by tasks that are about to be claimed on the
     # next dispatcher tick (default 60s) and would just be noise.
     "stranded_threshold_seconds": 30 * 60,
+    # Stale-heartbeat threshold. Matches kanban_db.DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
+    # so the diagnostic fires at exactly the same age the dispatcher uses for
+    # automatic reclaim — giving operators one full cycle of visibility before
+    # the dispatcher resets the task.
+    "heartbeat_stale_seconds": 60 * 60,
 }
 
 

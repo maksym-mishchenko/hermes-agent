@@ -3377,6 +3377,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         vacuum=bool(_sess_cfg.get("vacuum_after_prune", True)),
                         sessions_dir=self.config.sessions_dir,
                     )
+                elif _sess_cfg.get("retention_days", 90) != 90:
+                    logger.info(
+                        "state.db retention policy: retention_days=%d is set but "
+                        "sessions.auto_prune=false — old sessions will NOT be pruned "
+                        "automatically.  Set sessions.auto_prune: true in config.yaml "
+                        "to enforce the retention policy.",
+                        _sess_cfg.get("retention_days", 90),
+                    )
             except Exception as exc:
                 logger.debug("state.db auto-maintenance skipped: %s", exc)
 

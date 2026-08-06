@@ -468,3 +468,108 @@ def test_security_pins_present_in_mirrored_lazy_features():
         "pyproject extras — the lazy install path would not enforce the "
         "CVE-patched floor:\n  " + "\n  ".join(problems)
     )
+
+
+# ---------------------------------------------------------------------------
+# Langfuse / packaging constraint regression guard (2026-08-05 audit fix)
+# ---------------------------------------------------------------------------
+# langfuse <4.1.0 declared packaging<26, conflicting with hermes-agent's
+# packaging==26.0 pin.  langfuse 4.1.0 relaxed to packaging<27, making the
+# two constraints compatible without needing a uv override-dependencies entry.
+# The tests below ensure this fix cannot be silently reverted.
+
+
+def _parse_langfuse_floor(spec: str) -> tuple[int, ...] | None:
+    """Return the lower-bound version tuple from a langfuse requirement spec.
+
+    Handles ``langfuse>=4.1,<5`` and ``langfuse==4.1.0`` forms.
+    """
+    import re
+
+    m = re.search(r">=(\d+(?:\.\d+)*)", spec)
+    if m:
+        return _version_tuple(m.group(1))
+    m = re.search(r"==(\d+(?:\.\d+)*)", spec)
+    if m:
+        return _version_tuple(m.group(1))
+    return None
+
+
+def test_observability_extra_requires_langfuse_4_1_or_higher():
+    """Regression guard: observability extra must require langfuse>=4.1.
+
+    langfuse 3.x and 4.0.x declared `packaging<26`, conflicting with
+    hermes-agent's `packaging==26.0` core pin and producing a `pip check`
+    error in any venv that installed both (e.g. the live gateway with the
+    systemd-injected langfuse).  langfuse 4.1.0 relaxed to `packaging<27`,
+    making the constraints compatible without uv override hackery.
+
+    This test prevents reversion to an older langfuse constraint that would
+    re-introduce the packaging conflict.
+    """
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    obs_extra = data["project"]["optional-dependencies"].get("observability", [])
+
+    langfuse_specs = [s for s in obs_extra if s.lower().startswith("langfuse")]
+    assert langfuse_specs, (
+        "observability extra no longer declares langfuse — "
+        "update this test if the plugin dependency moved elsewhere"
+    )
+
+    for spec in langfuse_specs:
+        floor = _parse_langfuse_floor(spec)
+        assert floor is not None, f"Cannot parse floor from langfuse spec {spec!r}"
+        assert floor >= (4, 1), (
+            f"observability extra has langfuse spec {spec!r} with floor "
+            f"{'.'.join(str(v) for v in floor)} — must be >=4.1.  "
+            "langfuse <4.1 declares packaging<26 which conflicts with "
+            "hermes-agent's packaging==26.0 core pin."
+        )
+
+
+def test_locked_langfuse_is_4_1_or_higher():
+    """The committed uv.lock must resolve langfuse to >=4.1.
+
+    pyproject pins protect the declared extras, but the lockfile is what
+    hash-verified installs (``uv sync --locked``) actually pull.  A stale
+    lock could silently revert to an incompatible version.
+    """
+    lock = (REPO_ROOT / "uv.lock").read_text(encoding="utf-8")
+    locked_version: tuple[int, ...] | None = None
+    in_langfuse = False
+    for line in lock.splitlines():
+        if line.startswith("[[package]]"):
+            in_langfuse = False
+        elif line.strip() == 'name = "langfuse"':
+            in_langfuse = True
+        elif in_langfuse and line.startswith("version ="):
+            raw = line.split("=", 1)[1].strip().strip('"')
+            locked_version = _version_tuple(raw)
+            break
+
+    assert locked_version is not None, "langfuse not found in uv.lock"
+    assert locked_version >= (4, 1), (
+        f"uv.lock resolves langfuse to {'.'.join(str(v) for v in locked_version)}, "
+        "below the 4.1 minimum required for packaging<27 compatibility.  "
+        "Run `uv lock` and commit the updated lock file."
+    )
+
+
+def test_uv_override_dependencies_not_present_for_packaging():
+    """The [tool.uv] override-dependencies packaging workaround is removed.
+
+    The override was necessary only while the observability extra required
+    langfuse 3.x/4.0.x (which declared packaging<26).  Upgrading to
+    langfuse>=4.1 fixes the constraint natively; keeping the override would
+    be dead-code technical debt and would confuse future readers into
+    thinking there is still a metadata conflict that needs suppressing.
+    """
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    overrides = data.get("tool", {}).get("uv", {}).get("override-dependencies", [])
+    packaging_overrides = [s for s in overrides if s.lower().startswith("packaging")]
+    assert not packaging_overrides, (
+        f"[tool.uv] override-dependencies still contains packaging entry: "
+        f"{packaging_overrides!r}.  This was a workaround for langfuse 3.x's "
+        "packaging<26 constraint — it is no longer needed with langfuse>=4.1 "
+        "and should be removed."
+    )
