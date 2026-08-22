@@ -14,7 +14,8 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SKILL_MD = REPO_ROOT / "skills" / "autonomous-ai-agents" / "hermes-agent" / "SKILL.md"
-STATE_PY = REPO_ROOT / "hermes_state.py"
+# The sessions DDL moved from hermes_state.py to hermes_state_common.py in v0.20.5.
+STATE_PY = REPO_ROOT / "hermes_state_common.py"
 
 
 @pytest.fixture(scope="module")
