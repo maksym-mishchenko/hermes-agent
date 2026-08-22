@@ -1089,6 +1089,52 @@ def _rule_running_with_stale_heartbeat(task, events, runs, now, cfg) -> list[Dia
     )]
 
 
+def _rule_review_dependency_deadlock(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """Detect review-dependency deadlock: task blocked for review while its
+    child reviewer task can't start because the parent isn't done."""
+    status = _task_field(task, "status")
+    if status != "blocked":
+        return []
+    reason = _task_field(task, "block_reason", "") or ""
+    if "review-required" not in reason:
+        return []
+    graph = cfg.get("_graph")
+    if not graph:
+        return []
+    children = graph.get("children") or []
+    waiting = [c for c in children if (c.get("status") or "") == "todo"]
+    if not waiting:
+        return []
+    task_id = _task_field(task, "id") or "<task_id>"
+    waiting_ids = [c["id"] for c in waiting]
+    actions: list[DiagnosticAction] = [
+        DiagnosticAction(
+            kind="cli_hint",
+            label=f"hermes kanban unblock {task_id} --reason 'review complete'",
+            suggested=True,
+        ),
+    ]
+    return [Diagnostic(
+        kind="review_dependency_deadlock",
+        severity="error",
+        title="Review dependency deadlock detected",
+        detail=(
+            f"Task is blocked waiting for review, but its child reviewer "
+            f"task(s) cannot start because this parent task is not done. "
+            f"Unblock the parent or decouple the reviewer from the "
+            f"parent dependency."
+        ),
+        actions=actions,
+        first_seen_at=now,
+        last_seen_at=now,
+        count=1,
+        data={
+            "blocked_parent_id": task_id,
+            "waiting_child_ids": waiting_ids,
+        },
+    )]
+
+
 # Registry — order matters: rules higher on the list render first when
 # severity ties. Add new rules here.
 _RULES: list[RuleFn] = [
@@ -1101,6 +1147,7 @@ _RULES: list[RuleFn] = [
     _rule_block_unblock_cycling,
     _rule_stranded_in_ready,
     _rule_running_with_stale_heartbeat,
+    _rule_review_dependency_deadlock,
 ]
 
 
@@ -1116,6 +1163,7 @@ DIAGNOSTIC_KINDS = (
     "block_unblock_cycling",
     "stranded_in_ready",
     "running_with_stale_heartbeat",
+    "review_dependency_deadlock",
 )
 
 

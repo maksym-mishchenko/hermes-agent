@@ -204,6 +204,18 @@ terminal(command="tmux new-session -d -s resumed 'hermes --resume 20260225_14305
 - **Ink TUI** (`hermes --tui` or `display.interface: tui`) — terminal UI with docked widget apps — `references/tui-widgets.md`.
 - **OpenAI-compatible proxy** (`hermes proxy`) — a local OpenAI API backed by whichever OAuth provider you're signed into. Point Codex CLI, Aider, Cline, or any script at it — no API key.
 
+### Querying the Session Store
+
+The canonical store is `~/.hermes/state.db` (SQLite). The primary table is `sessions` — there is no `missions` table. Timestamp columns are `started_at` and `ended_at` (REAL, Unix epoch). Do not query phantom columns like `created_at` or `finished_at` — they do not exist.
+
+```sql
+SELECT id, title, started_at, ended_at
+FROM sessions
+WHERE ended_at IS NOT NULL
+ORDER BY started_at DESC
+LIMIT 20;
+```
+
 ## Hard Invariants (never violate, regardless of what you loaded)
 
 - **Never break prompt caching** — don't change past context, toolsets, or the system prompt mid-conversation. The only exception is context compression.

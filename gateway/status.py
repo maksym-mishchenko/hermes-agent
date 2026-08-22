@@ -50,6 +50,10 @@ _GATEWAY_RUNNING_PID_CACHE_TTL_SECONDS = 1.0
 _gateway_running_pid_cache_lock = threading.Lock()
 _gateway_running_pid_cache: dict[tuple[str, bool, bool], tuple[float, tuple[Any, ...], Optional[int]]] = {}
 
+# Supplemental POSIX flock handles held for scoped locks so external processes
+# can detect contention via nonblocking flock.  Keyed by lock file path string.
+_scoped_lock_flock_handles: dict[str, "IO"] = {}
+
 logger = logging.getLogger(__name__)
 
 
@@ -1634,6 +1638,16 @@ def acquire_scoped_lock(scope: str, identity: str, metadata: Optional[dict[str, 
         except OSError:
             pass
         raise
+    # Supplemental POSIX flock so external processes can detect contention
+    # via nonblocking flock (prevents same-file concurrent access even when
+    # the PID-based check would pass due to race windows).
+    if not _IS_WINDOWS:
+        try:
+            fh = open(lock_path, "r+")  # noqa: SIM115
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _scoped_lock_flock_handles[str(lock_path)] = fh
+        except OSError:
+            pass
     return True, None
 
 
@@ -1653,6 +1667,13 @@ def release_scoped_lock(scope: str, identity: str) -> None:
         lock_path.unlink(missing_ok=True)
     except OSError:
         pass
+    # Release supplemental flock handle
+    fh = _scoped_lock_flock_handles.pop(str(lock_path), None)
+    if fh:
+        try:
+            fh.close()
+        except OSError:
+            pass
 
 
 def release_all_scoped_locks(
@@ -1697,6 +1718,13 @@ def release_all_scoped_locks(
                 removed += 1
             except OSError:
                 pass
+            # Release supplemental flock handle
+            fh = _scoped_lock_flock_handles.pop(str(lock_file), None)
+            if fh:
+                try:
+                    fh.close()
+                except OSError:
+                    pass
     return removed
 
 
