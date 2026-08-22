@@ -1191,6 +1191,7 @@ def compute_task_diagnostics(
     *,
     now: Optional[int] = None,
     config: Optional[dict] = None,
+    graph: Optional[dict] = None,
 ) -> list[Diagnostic]:
     """Run every rule against a single task's state and return a
     severity-sorted list of active diagnostics.
@@ -1201,6 +1202,8 @@ def compute_task_diagnostics(
     now_ts = int(now if now is not None else time.time())
     config = config or {}
     cfg = {**DEFAULT_CONFIG, **config}
+    if graph is not None:
+        cfg["_graph"] = graph
     if (
         "failure_threshold" not in config
         and "spawn_failure_threshold" not in config
