@@ -24,6 +24,105 @@ def _jwt_with_claims(claims: dict) -> str:
     return f"{_part({'alg': 'none', 'typ': 'JWT'})}.{_part(claims)}.sig"
 
 
+def test_copilot_persisted_device_code_row_exchanges_once_in_memory(
+    tmp_path, monkeypatch
+):
+    """Legacy rows use an exchanged token without overwriting durable auth."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "copilot": [
+                    {
+                        "id": "legacy-device",
+                        "label": "legacy-device",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual:device_code",
+                        "access_token": "long-lived-github-token",
+                        "base_url": "https://api.githubcopilot.com",
+                    }
+                ]
+            },
+        },
+    )
+    monkeypatch.setattr(
+        "agent.credential_pool._seed_from_singletons", lambda *_args: (False, set())
+    )
+    monkeypatch.setattr(
+        "agent.credential_pool._seed_from_env", lambda *_args: (False, set())
+    )
+    calls = []
+
+    def fake_exchange(raw_token):
+        calls.append(raw_token)
+        return "short-lived-copilot-token", "https://api.enterprise.githubcopilot.com"
+
+    monkeypatch.setattr(
+        "hermes_cli.copilot_auth.get_copilot_api_token", fake_exchange
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("copilot")
+    entry = pool.entries()[0]
+
+    assert entry.runtime_api_key == "short-lived-copilot-token"
+    assert entry.runtime_base_url == "https://api.githubcopilot.com"
+    assert calls == ["long-lived-github-token"]
+
+    # A later status persistence must retain the durable GitHub token and
+    # never serialize either transient runtime value.
+    pool._persist()
+    persisted = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    row = persisted["credential_pool"]["copilot"][0]
+    assert row["access_token"] == "long-lived-github-token"
+    assert "_runtime_api_key" not in row
+    assert "_runtime_base_url" not in row
+    assert "short-lived-copilot-token" not in json.dumps(row)
+
+
+def test_copilot_non_device_code_row_is_not_exchanged(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "copilot": [
+                    {
+                        "id": "api-key",
+                        "label": "api-key",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "already-runtime-token",
+                        "base_url": "https://api.githubcopilot.com",
+                    }
+                ]
+            },
+        },
+    )
+    monkeypatch.setattr(
+        "agent.credential_pool._seed_from_singletons", lambda *_args: (False, set())
+    )
+    monkeypatch.setattr(
+        "agent.credential_pool._seed_from_env", lambda *_args: (False, set())
+    )
+    monkeypatch.setattr(
+        "hermes_cli.copilot_auth.get_copilot_api_token",
+        lambda _token: pytest.fail("non-device-code rows must not be exchanged"),
+    )
+
+    from agent.credential_pool import load_pool
+
+    entry = load_pool("copilot").entries()[0]
+    assert entry.runtime_api_key == "already-runtime-token"
+    assert entry.runtime_base_url == "https://api.githubcopilot.com"
+
+
 
 
 
