@@ -1643,7 +1643,7 @@ def acquire_scoped_lock(scope: str, identity: str, metadata: Optional[dict[str, 
     # the PID-based check would pass due to race windows).
     if not _IS_WINDOWS:
         try:
-            fh = open(lock_path, "r+")  # noqa: SIM115
+            fh = open(lock_path, "r+", encoding="utf-8")  # noqa: SIM115
             fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             _scoped_lock_flock_handles[str(lock_path)] = fh
         except OSError:
