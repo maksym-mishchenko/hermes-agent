@@ -259,12 +259,36 @@ class PooledCredential:
                 ):
                     return token.strip()
             return ""
+        if self.provider == "copilot" and self.source in {
+            "device_code",
+            "manual:device_code",
+        }:
+            # Device-code login stores the long-lived GitHub OAuth token in
+            # the pool.  Copilot inference does not accept that token
+            # directly: it must first be exchanged for the short-lived token
+            # returned by /copilot_internal/v2/token.  Session-local /model
+            # switches already perform this exchange; startup from the
+            # persisted pool must do the same.
+            from hermes_cli.copilot_auth import get_copilot_api_token
+
+            api_token, _ = get_copilot_api_token(str(self.access_token or ""))
+            return api_token
         return str(self.access_token or "")
 
     @property
     def runtime_base_url(self) -> Optional[str]:
         if self.provider == "nous":
             return self.inference_base_url or self.base_url
+        if self.provider == "copilot" and self.source in {
+            "device_code",
+            "manual:device_code",
+        }:
+            from hermes_cli.copilot_auth import get_copilot_api_token
+
+            _, exchanged_base_url = get_copilot_api_token(
+                str(self.access_token or "")
+            )
+            return exchanged_base_url or self.base_url
         return self.base_url
 
 

@@ -24,6 +24,62 @@ def _jwt_with_claims(claims: dict) -> str:
     return f"{_part({'alg': 'none', 'typ': 'JWT'})}.{_part(claims)}.sig"
 
 
+def test_copilot_device_code_entry_exchanges_github_token(monkeypatch):
+    """Persisted device-code credentials must match session-local /model.
+
+    The pool stores the long-lived GitHub OAuth token, while inference needs
+    the exchanged short-lived Copilot token and its advertised endpoint.
+    """
+    from agent.credential_pool import PooledCredential
+    from hermes_cli import copilot_auth
+
+    calls = []
+
+    def fake_exchange(raw_token):
+        calls.append(raw_token)
+        return "copilot-api-token", "https://api.enterprise.githubcopilot.com"
+
+    monkeypatch.setattr(copilot_auth, "get_copilot_api_token", fake_exchange)
+    entry = PooledCredential(
+        provider="copilot",
+        id="device",
+        label="device",
+        auth_type="api_key",
+        priority=0,
+        source="manual:device_code",
+        access_token="github-oauth-token",
+        base_url="https://api.githubcopilot.com",
+    )
+
+    assert entry.runtime_api_key == "copilot-api-token"
+    assert entry.runtime_base_url == "https://api.enterprise.githubcopilot.com"
+    assert calls == ["github-oauth-token", "github-oauth-token"]
+
+
+def test_copilot_api_key_entry_is_not_exchanged(monkeypatch):
+    from agent.credential_pool import PooledCredential
+    from hermes_cli import copilot_auth
+
+    monkeypatch.setattr(
+        copilot_auth,
+        "get_copilot_api_token",
+        lambda _token: pytest.fail("API-key entries must not be exchanged"),
+    )
+    entry = PooledCredential(
+        provider="copilot",
+        id="api-key",
+        label="api-key",
+        auth_type="api_key",
+        priority=0,
+        source="env:COPILOT_GITHUB_TOKEN",
+        access_token="already-exchanged-token",
+        base_url="https://api.githubcopilot.com",
+    )
+
+    assert entry.runtime_api_key == "already-exchanged-token"
+    assert entry.runtime_base_url == "https://api.githubcopilot.com"
+
+
 def test_fill_first_selection_skips_recently_exhausted_entry(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     _write_auth_store(
