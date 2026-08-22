@@ -1099,7 +1099,7 @@ def _rule_review_dependency_deadlock(task, events, runs, now, cfg) -> list[Diagn
     # not as a field on the task itself.
     reason = ""
     for ev in reversed(events):
-        if _task_field(ev, "event_type", "") == "blocked":
+        if _task_field(ev, "kind", "") == "blocked":
             payload = _parse_payload(ev)
             reason = payload.get("reason") or ""
             break
