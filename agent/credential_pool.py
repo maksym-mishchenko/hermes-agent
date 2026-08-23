@@ -9,7 +9,7 @@ import threading
 import time
 import uuid
 import re
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, field, fields, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -215,6 +215,16 @@ class PooledCredential:
     agent_key_expires_at: Optional[str] = None
     request_count: int = 0
     extra: Dict[str, Any] = None  # type: ignore[assignment]
+    # Runtime-only Copilot values populated when a legacy persisted
+    # device-code row is loaded. They are deliberately excluded from pool
+    # serialization so the long-lived GitHub OAuth token remains the durable
+    # value and the short-lived inference token exists only in memory.
+    _runtime_api_key: Optional[str] = field(
+        default=None, init=False, repr=False, compare=False
+    )
+    _runtime_base_url: Optional[str] = field(
+        default=None, init=False, repr=False, compare=False
+    )
 
     def __post_init__(self):
         if self.extra is None:
@@ -232,7 +242,11 @@ class PooledCredential:
 
     @classmethod
     def from_dict(cls, provider: str, payload: Dict[str, Any]) -> "PooledCredential":
-        field_names = {f.name for f in fields(cls) if f.name != "provider"}
+        field_names = {
+            f.name
+            for f in fields(cls)
+            if f.name not in {"provider", "_runtime_api_key", "_runtime_base_url"}
+        }
         data = {k: payload.get(k) for k in field_names if k in payload}
         # Rehydrated last_status_at may be an ISO string from to_dict() — normalize to float epoch
         if "last_status_at" in data and isinstance(data["last_status_at"], str):
@@ -258,7 +272,12 @@ class PooledCredential:
         }
         result: Dict[str, Any] = {}
         for field_def in fields(self):
-            if field_def.name in {"provider", "extra"}:
+            if field_def.name in {
+                "provider",
+                "extra",
+                "_runtime_api_key",
+                "_runtime_base_url",
+            }:
                 continue
             value = getattr(self, field_def.name)
             if value is not None or field_def.name in _ALWAYS_EMIT:
@@ -288,12 +307,16 @@ class PooledCredential:
                 ):
                     return token.strip()
             return ""
+        if self._runtime_api_key is not None:
+            return self._runtime_api_key
         return str(self.access_token or "")
 
     @property
     def runtime_base_url(self) -> Optional[str]:
         if self.provider == "nous":
             return self.inference_base_url or self.base_url
+        if self._runtime_base_url is not None:
+            return self._runtime_base_url
         return self.base_url
 
 
@@ -3129,6 +3152,35 @@ def _seed_custom_pool(pool_key: str, entries: List[PooledCredential]) -> Tuple[b
     return changed, active_sources
 
 
+def _prepare_copilot_legacy_runtime_entries(
+    provider: str, entries: List[PooledCredential]
+) -> None:
+    """Exchange legacy persisted Copilot device-code rows once, in memory.
+
+    Older Hermes versions persisted the long-lived GitHub OAuth token under
+    ``device_code``/``manual:device_code``. Copilot inference requires the
+    short-lived token returned by the exchange endpoint. Keep the persisted
+    token untouched so future processes can exchange it again; only attach
+    transient runtime values after any pool write-back has completed.
+    """
+    if provider != "copilot":
+        return
+
+    from hermes_cli.copilot_auth import get_copilot_api_token
+
+    for entry in entries:
+        if entry.source not in {"device_code", SOURCE_MANUAL_DEVICE_CODE}:
+            continue
+        raw_token = str(entry.access_token or "")
+        if not raw_token:
+            continue
+        api_token, exchanged_base_url = get_copilot_api_token(raw_token)
+        entry._runtime_api_key = api_token
+        # A persisted explicit endpoint is operator intent and wins over
+        # exchange-derived auto-discovery, matching PR #31's precedence.
+        entry._runtime_base_url = entry.base_url or exchanged_base_url
+
+
 def load_pool(provider: str) -> CredentialPool:
     provider = (provider or "").strip().lower()
     raw_entries = read_credential_pool(provider)
@@ -3192,4 +3244,5 @@ def load_pool(provider: str) -> CredentialPool:
             [entry.to_dict() for entry in sorted(entries, key=lambda item: item.priority)],
             removed_ids=disk_ids - new_ids,
         )
+    _prepare_copilot_legacy_runtime_entries(provider, entries)
     return CredentialPool(provider, entries)
