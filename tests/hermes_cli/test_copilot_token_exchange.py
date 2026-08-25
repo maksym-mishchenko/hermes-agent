@@ -118,6 +118,94 @@ class TestDeriveBaseUrlFromProxyEp:
         assert _derive_base_url_from_proxy_ep(token) == "https://api.enterprise.githubcopilot.com"
 
 
+class TestResolveCopilotBaseUrl:
+    """Tests for resolve_copilot_base_url() — the endpoint precedence fix.
+
+    Regression: token exchange derives an enterprise endpoint from the
+    token's `proxy-ep` field, and callers previously let that endpoint win
+    unconditionally, silently shadowing an operator's explicit
+    COPILOT_API_BASE_URL override and causing HTTP 403 for models not
+    served on that enterprise host. Precedence must be:
+    explicit override > exchange-derived endpoint > registry default.
+    """
+
+    def test_explicit_override_wins_over_exchanged_enterprise_endpoint(self):
+        from hermes_cli.copilot_auth import resolve_copilot_base_url
+
+        result = resolve_copilot_base_url(
+            explicit_override="https://api.githubcopilot.com",
+            exchanged_base_url="https://api.enterprise.githubcopilot.com",
+            registry_default="https://api.githubcopilot.com",
+        )
+        assert result == "https://api.githubcopilot.com"
+
+    def test_exchanged_enterprise_endpoint_used_when_no_override(self):
+        """Enterprise auto-discovery is preserved when no override is set."""
+        from hermes_cli.copilot_auth import resolve_copilot_base_url
+
+        result = resolve_copilot_base_url(
+            explicit_override=None,
+            exchanged_base_url="https://api.enterprise.githubcopilot.com",
+            registry_default="https://api.githubcopilot.com",
+        )
+        assert result == "https://api.enterprise.githubcopilot.com"
+
+    def test_registry_default_used_when_neither_override_nor_exchange(self):
+        from hermes_cli.copilot_auth import resolve_copilot_base_url
+
+        result = resolve_copilot_base_url(
+            explicit_override=None,
+            exchanged_base_url=None,
+            registry_default="https://api.githubcopilot.com",
+        )
+        assert result == "https://api.githubcopilot.com"
+
+    def test_explicit_override_wins_even_with_no_exchange_result(self):
+        from hermes_cli.copilot_auth import resolve_copilot_base_url
+
+        result = resolve_copilot_base_url(
+            explicit_override="https://ghe.example.com/api/copilot",
+            exchanged_base_url=None,
+            registry_default="https://api.githubcopilot.com",
+        )
+        assert result == "https://ghe.example.com/api/copilot"
+
+    def test_blank_override_does_not_shadow_exchange_result(self):
+        """An unset/blank override (empty string, common when an env var is
+        defined but empty) must not be treated as an explicit choice."""
+        from hermes_cli.copilot_auth import resolve_copilot_base_url
+
+        result = resolve_copilot_base_url(
+            explicit_override="   ",
+            exchanged_base_url="https://api.enterprise.githubcopilot.com",
+            registry_default="https://api.githubcopilot.com",
+        )
+        assert result == "https://api.enterprise.githubcopilot.com"
+
+    def test_malformed_override_fails_closed(self):
+        """A malformed override must raise rather than being silently
+        discarded and falling through to the exchanged/default endpoint."""
+        from hermes_cli.copilot_auth import resolve_copilot_base_url
+
+        with pytest.raises(ValueError):
+            resolve_copilot_base_url(
+                explicit_override="not-a-valid-url",
+                exchanged_base_url="https://api.enterprise.githubcopilot.com",
+                registry_default="https://api.githubcopilot.com",
+            )
+
+    def test_override_missing_scheme_fails_closed(self):
+        from hermes_cli.copilot_auth import resolve_copilot_base_url
+
+        with pytest.raises(ValueError):
+            resolve_copilot_base_url(explicit_override="api.githubcopilot.com")
+
+    def test_override_trailing_slash_normalized(self):
+        from hermes_cli.copilot_auth import resolve_copilot_base_url
+
+        result = resolve_copilot_base_url(explicit_override="https://api.githubcopilot.com/")
+        assert result == "https://api.githubcopilot.com"
+
 
 
     @patch("urllib.request.urlopen")

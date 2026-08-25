@@ -26,6 +26,7 @@ import subprocess
 import time
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 from hermes_cli._subprocess_compat import IS_WINDOWS, windows_hide_flags
 
@@ -688,6 +689,65 @@ def _derive_base_url_from_proxy_ep(token: str) -> Optional[str]:
         api_host = proxy_ep
 
     return f"https://{api_host}"
+
+
+def _validate_explicit_copilot_base_url(value: str) -> str:
+    """Validate an operator-configured Copilot base URL override.
+
+    Returns the normalized (trailing-slash-trimmed) URL. Raises
+    ``ValueError`` if ``value`` is not a well-formed absolute http(s) URL.
+
+    Copilot Enterprise hosts vary per-org (``api.enterprise.githubcopilot.com``,
+    GitHub Enterprise Server custom domains, ...), so — unlike single-tenant
+    OAuth providers — there is no fixed host to pin an override to. The
+    override must still fail closed on nonsense input rather than being
+    silently discarded and falling through to the auto-discovered endpoint:
+    a malformed override that gets ignored would look, from the operator's
+    side, exactly like the endpoint-precedence bug this function fixes.
+    """
+    candidate = value.strip().rstrip("/")
+    parsed = urlparse(candidate)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError(
+            f"Invalid Copilot base URL override {value!r}: expected an "
+            "absolute http(s) URL (e.g. https://api.githubcopilot.com)."
+        )
+    return candidate
+
+
+def resolve_copilot_base_url(
+    *,
+    explicit_override: Optional[str] = None,
+    exchanged_base_url: Optional[str] = None,
+    registry_default: str = "",
+) -> str:
+    """Resolve the effective Copilot API base URL.
+
+    Precedence (highest to lowest):
+      1. ``explicit_override`` — an operator-configured endpoint, e.g. from
+         ``COPILOT_API_BASE_URL``. A non-empty override always wins, even
+         when token exchange derives an enterprise endpoint from the
+         token's ``proxy-ep`` field. This is the fix for the endpoint
+         precedence regression where an auto-discovered enterprise host
+         silently shadowed an operator's explicit public-endpoint override.
+      2. ``exchanged_base_url`` — the endpoint returned or derived by
+         ``exchange_copilot_token``/``get_copilot_api_token`` (authoritative
+         ``endpoints.api``, with a ``proxy-ep`` fallback). Preserves
+         Enterprise/proxied account auto-discovery when no explicit
+         override is configured.
+      3. ``registry_default`` — the provider registry's static default
+         (``https://api.githubcopilot.com``).
+
+    Raises ``ValueError`` if ``explicit_override`` is non-empty but not a
+    well-formed absolute http(s) URL — see ``_validate_explicit_copilot_base_url``.
+    """
+    override = (explicit_override or "").strip()
+    if override:
+        return _validate_explicit_copilot_base_url(override)
+    exchanged = (exchanged_base_url or "").strip().rstrip("/")
+    if exchanged:
+        return exchanged
+    return (registry_default or "").strip().rstrip("/")
 
 
 def get_copilot_api_token(raw_token: str) -> tuple[str, Optional[str]]:

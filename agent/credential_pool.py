@@ -2682,6 +2682,7 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
                 COPILOT_ENV_VARS,
                 resolve_copilot_token,
                 get_copilot_api_token,
+                resolve_copilot_base_url,
             )
             # All-sources suppression gate BEFORE any work — including the
             # `gh auth token` subprocess spawn.  resolve_copilot_token()
@@ -2730,10 +2731,25 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
                     )
                 active_sources.add(source_name)
                 pconfig = PROVIDER_REGISTRY.get(provider)
-                # Use enterprise base URL from token exchange if available,
-                # otherwise fall back to the provider's default.
-                effective_base_url = enterprise_base_url or (
-                    pconfig.inference_base_url if pconfig else ""
+                # Precedence: an explicit operator override
+                # (COPILOT_API_BASE_URL, read via the same .env-preferring
+                # helper every other provider uses) always wins over the
+                # endpoint auto-discovered from token exchange, which in
+                # turn wins over the registry default. Previously the
+                # exchange-derived enterprise endpoint (auto-discovered from
+                # the token's proxy-ep) took precedence unconditionally,
+                # silently shadowing an operator's explicit override and
+                # causing HTTP 403s for models not served on that enterprise
+                # host (#regression: v0.20.5 endpoint precedence).
+                explicit_base_url = (
+                    get_env_prefer_dotenv(pconfig.base_url_env_var)
+                    if pconfig and pconfig.base_url_env_var
+                    else ""
+                )
+                effective_base_url = resolve_copilot_base_url(
+                    explicit_override=explicit_base_url,
+                    exchanged_base_url=enterprise_base_url,
+                    registry_default=pconfig.inference_base_url if pconfig else "",
                 )
                 changed |= _upsert_entry(
                     entries,

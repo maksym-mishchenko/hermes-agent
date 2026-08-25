@@ -1651,6 +1651,83 @@ def test_load_pool_skips_resolve_when_all_copilot_sources_suppressed(tmp_path, m
     assert pool.entries() == []
 
 
+# ─── Copilot endpoint precedence (v0.20.5 regression) ──────────────────────
+#
+# Token exchange derives an enterprise endpoint from the token's `proxy-ep`
+# field. `_seed_credentials` previously used that endpoint unconditionally,
+# silently shadowing an operator's explicit `COPILOT_API_BASE_URL` override
+# and causing HTTP 403s for models not served on that enterprise host.
+# Precedence must be: explicit override > token-exchange-derived endpoint >
+# registry default.
+
+def _seed_copilot_pool(tmp_path, monkeypatch, *, exchanged_base_url):
+    """Seed a copilot pool via `gh auth token`, with a mocked exchange result."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(tmp_path, {"version": 1, "credential_pool": {}})
+    monkeypatch.setattr(
+        "hermes_cli.copilot_auth.resolve_copilot_token",
+        lambda: ("gho_fake_token_abc123", "gh auth token"),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.copilot_auth.get_copilot_api_token",
+        lambda token: ("exchanged_jwt_token", exchanged_base_url),
+    )
+
+    from agent.credential_pool import load_pool
+    return load_pool("copilot")
+
+
+def test_load_pool_copilot_explicit_override_wins_over_enterprise_endpoint(tmp_path, monkeypatch):
+    """An explicit COPILOT_API_BASE_URL override wins even when token exchange
+    derives a (synthetic proxy-ep) enterprise endpoint. This is the exact
+    production regression: a public-endpoint override was being silently
+    shadowed by an auto-discovered enterprise host, causing 403s."""
+    monkeypatch.setenv("COPILOT_API_BASE_URL", "https://api.githubcopilot.com")
+    pool = _seed_copilot_pool(
+        tmp_path, monkeypatch, exchanged_base_url="https://api.enterprise.githubcopilot.com"
+    )
+
+    entries = pool.entries()
+    assert len(entries) == 1
+    assert entries[0].base_url == "https://api.githubcopilot.com"
+
+
+def test_load_pool_copilot_enterprise_auto_discovery_preserved_without_override(tmp_path, monkeypatch):
+    """With no explicit override configured, the token-exchange-derived
+    enterprise endpoint must still be used (auto-discovery is preserved)."""
+    monkeypatch.delenv("COPILOT_API_BASE_URL", raising=False)
+    pool = _seed_copilot_pool(
+        tmp_path, monkeypatch, exchanged_base_url="https://api.enterprise.githubcopilot.com"
+    )
+
+    entries = pool.entries()
+    assert len(entries) == 1
+    assert entries[0].base_url == "https://api.enterprise.githubcopilot.com"
+
+
+def test_load_pool_copilot_registry_default_when_no_override_or_exchange_endpoint(tmp_path, monkeypatch):
+    """With neither an explicit override nor an exchange-derived endpoint
+    (e.g. an individual account), the registry default must be used."""
+    monkeypatch.delenv("COPILOT_API_BASE_URL", raising=False)
+    pool = _seed_copilot_pool(tmp_path, monkeypatch, exchanged_base_url=None)
+
+    entries = pool.entries()
+    assert len(entries) == 1
+    assert entries[0].base_url == "https://api.githubcopilot.com"
+
+
+def test_load_pool_copilot_malformed_override_fails_closed(tmp_path, monkeypatch):
+    """A malformed explicit override must fail closed: no Copilot credential
+    is seeded (rather than silently ignoring the override and falling back
+    to the enterprise/registry endpoint, which would defeat the operator's
+    intent without any signal)."""
+    monkeypatch.setenv("COPILOT_API_BASE_URL", "not-a-valid-url")
+    pool = _seed_copilot_pool(
+        tmp_path, monkeypatch, exchanged_base_url="https://api.enterprise.githubcopilot.com"
+    )
+
+    assert pool.entries() == []
+
 
 
 def test_load_pool_seeds_qwen_oauth_via_cli_tokens(tmp_path, monkeypatch):
