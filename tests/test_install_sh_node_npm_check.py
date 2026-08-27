@@ -33,10 +33,25 @@ def test_check_node_requires_npm_alongside_node() -> None:
 
 
 def test_check_node_managed_requires_npm() -> None:
-    """The Hermes-managed Node fallback also requires its npm to exist."""
+    """Managed Node must reject npm versions that cannot honor repo policy."""
     text = INSTALL_SH.read_text()
     assert (
         '[ -x "$HERMES_HOME/node/bin/node" ] && [ -x "$HERMES_HOME/node/bin/npm" ] \\'
         in text
     )
+    managed = text.split(
+        "# Prefer a Hermes-managed Node from a previous run", 1
+    )[1].split("if command -v node", 1)[0]
+    assert "npm_supports_npmrc" in managed
+    assert "install_node" in managed
+
+
+def test_fresh_managed_node_repairs_incompatible_bundled_npm() -> None:
+    text = INSTALL_SH.read_text()
+    install_node = text.split("install_node()", 1)[1].split(
+        "check_network_prerequisites()", 1
+    )[0]
+    assert "npm_supports_npmrc" in install_node
+    assert 'npm" install -g --prefix "$HERMES_HOME/node"' in install_node
+    assert "npm@latest" in install_node
 
