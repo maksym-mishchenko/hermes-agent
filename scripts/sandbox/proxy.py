@@ -155,11 +155,19 @@ def relay_tunnel(client, upstream):
     """Relay an opaque CONNECT tunnel in both directions until either side closes."""
     sockets = (client, upstream)
     while True:
-        readable, _, _ = select.select(sockets, (), (), UPSTREAM_TIMEOUT_SECONDS)
+        try:
+            readable, _, _ = select.select(
+                sockets, (), (), UPSTREAM_TIMEOUT_SECONDS
+            )
+        except (OSError, ValueError):
+            return
         if not readable:
             return
         for source in readable:
-            chunk = source.recv(MAX_REQUEST_BYTES)
+            try:
+                chunk = source.recv(MAX_REQUEST_BYTES)
+            except OSError:
+                return
             if not chunk:
                 return
             destination = upstream if source is client else client

@@ -444,6 +444,11 @@ if [ ! -f "$SANDBOX_ROOT/root/certs/ca.pem" ]; then
     exit 1
   fi
 fi
+# Clients need both roots: the throwaway CA for fixture-host MITM responses and
+# the system bundle for opaque CONNECT tunnels to npm, PyPI, GitHub, and others.
+cat "$SANDBOX_ROOT/root/certs/ca.pem" \
+    "$SANDBOX_ROOT/root/certs/real-ca.pem" \
+    > "$SANDBOX_ROOT/root/certs/trust.pem"
 GIT_UPLOAD_PACK="$(command -v git-upload-pack)"
 sed "s|@GIT_UPLOAD_PACK@|$GIT_UPLOAD_PACK|" "$SANDBOX_ASSETS/ssh-shim.sh" \
   > "$SANDBOX_ROOT/root/usr/bin/ssh"
