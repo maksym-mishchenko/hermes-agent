@@ -55,3 +55,13 @@ def test_fresh_managed_node_repairs_incompatible_bundled_npm() -> None:
     assert 'npm" install -g --prefix "$HERMES_HOME/node"' in install_node
     assert "npm@latest" in install_node
 
+
+def test_managed_node_drops_caller_node_gyp_header_override() -> None:
+    text = INSTALL_SH.read_text()
+    install_deps = text.split("install_node_deps()", 1)[1].split(
+        "install_browser_use_cli()", 1
+    )[0]
+    assert 'readlink -f "$(command -v node)"' in install_deps
+    assert '"$HERMES_HOME/node/bin/node"' in install_deps
+    assert "unset npm_config_nodedir npm_package_config_node_gyp_nodedir" in install_deps
+
