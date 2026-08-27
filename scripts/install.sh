@@ -2343,8 +2343,15 @@ install_node_deps() {
     fi
 
     if [ -f "$INSTALL_DIR/package.json" ]; then
-        log_info "Installing Node.js dependencies (browser tools)..."
+        log_info "Installing Node.js dependencies (browser tools) with npm $(npm --version 2>/dev/null || printf unknown)..."
         cd "$INSTALL_DIR"
+        # A caller-provided node-gyp header root belongs to its original Node.
+        # Once the installer selected Hermes-managed Node, keeping that override
+        # can point native builds at mismatched or absent headers (for example
+        # /usr/local/common.gypi on hosted runners).
+        if [ "$(readlink -f "$(command -v node)")" = "$HERMES_HOME/node/bin/node" ]; then
+            unset npm_config_nodedir npm_package_config_node_gyp_nodedir
+        fi
         # Time-boxed: a stalled registry fetch would otherwise hang here with no
         # progress (same #39219 stall class as the desktop build below).
         # A failed npm install used to still print "✓ Node.js dependencies
@@ -2353,7 +2360,7 @@ install_node_deps() {
         # Capture npm output so failures are diagnosable (#87340).
         local npm_log
         npm_log="$(mktemp)"
-        if ! run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --silent \
+        if ! run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --loglevel=error \
                 >"$npm_log" 2>&1; then
             log_error "npm install failed or timed out; Node.js dependencies were not installed"
             if [ -s "$npm_log" ]; then
