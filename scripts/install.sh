@@ -858,10 +858,15 @@ check_node() {
     # Prefer a Hermes-managed Node from a previous run over a too-old system one.
     if [ -x "$HERMES_HOME/node/bin/node" ] && [ -x "$HERMES_HOME/node/bin/npm" ] \
         && node_satisfies_build "$("$HERMES_HOME/node/bin/node" --version)"; then
-        export PATH="$HERMES_HOME/node/bin:$PATH"
-        log_success "Node.js $("$HERMES_HOME/node/bin/node" --version) found (Hermes-managed)"
-        HAS_NODE=true
-        return 0
+        if npm_supports_npmrc "$("$HERMES_HOME/node/bin/npm" --version 2>/dev/null)"; then
+            export PATH="$HERMES_HOME/node/bin:$PATH"
+            log_success "Node.js $("$HERMES_HOME/node/bin/node" --version) found (Hermes-managed)"
+            HAS_NODE=true
+            return 0
+        fi
+        log_warn "Hermes-managed npm $("$HERMES_HOME/node/bin/npm" --version) is incompatible — refreshing managed Node/npm..."
+        install_node
+        return
     fi
 
     if command -v node &> /dev/null && ! command -v npm &> /dev/null; then
@@ -984,6 +989,25 @@ install_node() {
     configure_managed_node_npm_prefix
 
     export PATH="$HERMES_HOME/node/bin:$PATH"
+
+    local managed_npm_version
+    managed_npm_version=$("$HERMES_HOME/node/bin/npm" --version 2>/dev/null)
+    if ! npm_supports_npmrc "$managed_npm_version"; then
+        log_warn "Bundled npm $managed_npm_version is incompatible with this repo; upgrading managed npm..."
+        if ! (cd "$HERMES_HOME/node" && \
+            "$HERMES_HOME/node/bin/npm" install -g --prefix "$HERMES_HOME/node" \
+                --silent --ignore-scripts npm@latest); then
+            log_warn "Failed to install a compatible managed npm"
+            HAS_NODE=false
+            return 0
+        fi
+        managed_npm_version=$("$HERMES_HOME/node/bin/npm" --version 2>/dev/null)
+        if ! npm_supports_npmrc "$managed_npm_version"; then
+            log_warn "Managed npm $managed_npm_version remains incompatible"
+            HAS_NODE=false
+            return 0
+        fi
+    fi
 
     local installed_ver
     installed_ver=$("$HERMES_HOME/node/bin/node" --version 2>/dev/null)
