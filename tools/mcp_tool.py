@@ -348,6 +348,15 @@ _RECYCLED_RECONNECT_TIMEOUT = 15.0
 _DEFAULT_KEEPALIVE_INTERVAL = 180  # seconds between liveness pings
 _MIN_KEEPALIVE_INTERVAL = 5        # clamp floor for configured intervals
 
+# Final shutdown gives pending MCP-loop tasks one bounded cancellation cycle
+# before closing their owning loop. Cooperative parked/reconnect waiters finish
+# immediately; cancellation-resistant tasks must not hang process exit.
+_MCP_LOOP_DRAIN_TIMEOUT = 3.0
+
+
+class MCPShutdownInProgressError(RuntimeError):
+    """Raised when MCP work is requested after teardown has claimed the loop."""
+
 # Environment variables that are safe to pass to stdio subprocesses
 _SAFE_ENV_KEYS = frozenset({
     "PATH", "HOME", "USER", "LANG", "LC_ALL", "TERM", "SHELL", "TMPDIR",
@@ -2799,11 +2808,18 @@ class MCPServerTask:
         revival must publish the freshly discovered tools again — otherwise
         the transport comes back alive with zero registered tools.
         """
-        if not self._ready.is_set() or self._registered_tool_names:
+        if self._registered_tool_names:
             return
+        if not self._ready.is_set():
+            with _lock:
+                if _servers.get(self.name) is not self:
+                    return
         self._registered_tool_names = _register_server_tools(
             self.name, self, self._config
         )
+        with _lock:
+            if _servers.get(self.name) is self:
+                _server_connect_errors.pop(self.name, None)
 
     async def run(self, config: dict):
         """Long-lived coroutine: connect, discover tools, wait, disconnect.
@@ -3169,6 +3185,12 @@ class MCPServerTask:
 _servers: Dict[str, MCPServerTask] = {}
 _server_connecting: set[str] = set()
 _server_connect_errors: Dict[str, str] = {}
+# Discovery installs a task-local claim before calling ``_connect_server`` so
+# it can retain a recoverable parked task without making standalone probe calls
+# publish failed servers into module-global ownership.
+_connect_server_claim: contextvars.ContextVar[
+    Optional[Callable[[MCPServerTask], None]]
+] = contextvars.ContextVar("mcp_connect_server_claim", default=None)
 
 # Circuit breaker: consecutive error counts per server.  After
 # _CIRCUIT_BREAKER_THRESHOLD consecutive failures, the handler returns
@@ -3651,10 +3673,23 @@ _mcp_tool_server_names: Dict[str, str] = {}
 # Dedicated event loop running in a background daemon thread.
 _mcp_loop: Optional[asyncio.AbstractEventLoop] = None
 _mcp_thread: Optional[threading.Thread] = None
+_mcp_loop_shutting_down = False
+_mcp_shutdown_servers: tuple = ()
+_mcp_shutdown_deadline: Optional[float] = None
+_mcp_shutdown_future: Optional[concurrent.futures.Future] = None
+_mcp_shutdown_finalizing = False
+_mcp_finalization_future: Optional[concurrent.futures.Future] = None
+# Number of callers that have joined the current shutdown wave and have not
+# returned yet.  A failed coordinator remains authoritative until this reaches
+# zero, preventing a caller arriving mid-wave from starting a second attempt.
+_mcp_shutdown_waiters = 0
+_mcp_shutdown_wave_active = False
+# Schedulers validate this under _lock immediately before admission.
+_mcp_generation = 0
 
 # Protects _mcp_loop, _mcp_thread, _servers, MCP connection status maps,
 # _parallel_safe_servers, _mcp_tool_server_names, and _stdio_pids.
-_lock = threading.Lock()
+_lock = threading.RLock()
 
 # PIDs of stdio MCP server subprocesses.  Tracked so we can force-kill
 # them on shutdown if the graceful cleanup (SDK context-manager teardown)
@@ -3779,8 +3814,16 @@ def _ensure_mcp_loop():
     """Start the background event loop thread if not already running."""
     global _mcp_loop, _mcp_thread
     with _lock:
-        if _mcp_loop is not None and _mcp_loop.is_running():
-            return
+        if _mcp_loop_shutting_down:
+            raise MCPShutdownInProgressError("MCP event loop is shutting down")
+        if _mcp_loop is not None:
+            if _mcp_loop.is_running():
+                return
+            if not _discard_stale_mcp_loop_locked():
+                # A stopped loop whose thread or tasks cannot be proven gone
+                # is still owned. Replacing it could strand work on the old
+                # owner and corrupt the single-loop invariant.
+                raise RuntimeError("MCP event loop is stopped but still owned")
         _mcp_loop = asyncio.new_event_loop()
         _mcp_loop.set_exception_handler(_mcp_loop_exception_handler)
         _mcp_thread = threading.Thread(
@@ -3791,7 +3834,57 @@ def _ensure_mcp_loop():
         _mcp_thread.start()
 
 
-def _wrap_with_home_override(coro: "Coroutine") -> "Coroutine":
+def _discard_stale_mcp_loop_locked() -> bool:
+    """Close and forget a provably quiescent stopped MCP loop.
+
+    The caller must hold ``_lock``.  A stopped loop is not reusable, but it is
+    only safe to replace when its thread is dead and it has no asyncio tasks.
+    In particular, do not discard a loop while a shutdown future is still
+    pending: that future may be the only owner capable of finishing cleanup.
+    """
+    global _mcp_loop, _mcp_thread, _mcp_loop_shutting_down
+    global _mcp_shutdown_servers, _mcp_shutdown_deadline, _mcp_shutdown_future
+    global _mcp_shutdown_finalizing, _mcp_finalization_future
+    global _mcp_shutdown_wave_active
+
+    loop = _mcp_loop
+    thread = _mcp_thread
+    if loop is None or loop.is_running():
+        return False
+    if thread is not None and thread.is_alive():
+        return False
+    if _mcp_shutdown_future is not None and not _mcp_shutdown_future.done():
+        return False
+    try:
+        pending = [task for task in asyncio.all_tasks(loop) if not task.done()]
+    except RuntimeError:
+        pending = []  # closed loop: there is no schedulable work left
+    if pending:
+        return False
+    if not loop.is_closed():
+        try:
+            loop.close()
+        except Exception:
+            logger.warning("Error closing stale MCP event loop", exc_info=True)
+            return False
+    _mcp_loop = None
+    _mcp_thread = None
+    _mcp_loop_shutting_down = False
+    _mcp_shutdown_servers = ()
+    _mcp_shutdown_deadline = None
+    _mcp_shutdown_future = None
+    _mcp_shutdown_finalizing = False
+    _mcp_shutdown_wave_active = False
+    finalization = _mcp_finalization_future
+    _mcp_finalization_future = None
+    if finalization is not None and not finalization.done():
+        finalization.set_result(False)
+    _servers.clear()
+    _server_connecting.clear()
+    return True
+
+
+def _wrap_with_home_override(coro: "Coroutine", *, on_start=None) -> "Coroutine":
     """Carry the caller's context-local HERMES_HOME override into ``coro``.
 
     Returns ``coro`` unchanged when no override is active. Otherwise wraps
@@ -3813,6 +3906,8 @@ def _wrap_with_home_override(coro: "Coroutine") -> "Coroutine":
         return coro
 
     async def _scoped():
+        if on_start is not None:
+            on_start()
         token = set_hermes_home_override(home_override)
         try:
             return await coro
@@ -3822,7 +3917,7 @@ def _wrap_with_home_override(coro: "Coroutine") -> "Coroutine":
     return _scoped()
 
 
-def _wrap_with_dashboard_oauth_flow(coro):
+def _wrap_with_dashboard_oauth_flow(coro, *, on_start=None):
     """Propagate a dashboard OAuth flow onto the dedicated MCP loop task."""
     try:
         from tools.mcp_dashboard_oauth import (
@@ -3837,6 +3932,8 @@ def _wrap_with_dashboard_oauth_flow(coro):
         return coro
 
     async def _scoped():
+        if on_start is not None:
+            on_start()
         with dashboard_oauth_flow(flow):
             return await coro
 
@@ -3857,14 +3954,47 @@ def _run_on_mcp_loop(coro_or_factory, timeout: float = 30):
     from tools.interrupt import is_interrupted
     from agent.async_utils import safe_schedule_threadsafe
 
+    # Take a snapshot before invoking arbitrary factories.  Factories
+    # are user/plugin code and may block; teardown must be able to claim the
+    # loop while one is constructing its coroutine.
     with _lock:
-        loop = _mcp_loop
-    if loop is None or not loop.is_running():
-        if asyncio.iscoroutine(coro_or_factory):
-            coro_or_factory.close()
-        raise RuntimeError("MCP event loop is not running")
+        admission_generation = _mcp_generation
+        admission_loop = _mcp_loop
+        if (
+            _mcp_loop_shutting_down
+            or admission_loop is None
+            or not admission_loop.is_running()
+        ):
+            if inspect.iscoroutine(coro_or_factory):
+                coro_or_factory.close()
+            if _mcp_loop_shutting_down:
+                raise MCPShutdownInProgressError("MCP event loop is shutting down")
+            raise RuntimeError("MCP event loop is not running")
 
     coro = coro_or_factory() if callable(coro_or_factory) else coro_or_factory
+    owned_coroutines = [coro] if inspect.iscoroutine(coro) else []
+    outer_started = False
+
+    def _mark_outer_started():
+        nonlocal outer_started
+        outer_started = True
+
+    def _close_owned_coroutines():
+        # The outer wrapper does not close a coroutine it has not started
+        # awaiting.  Close outer-to-inner, de-duplicated.  Once it has started,
+        # closing the outer coroutine propagates cancellation to its awaited
+        # inner coroutine; closing the inner separately would be double-close.
+        closed = set()
+        owned_to_close = owned_coroutines[-1:] if outer_started else owned_coroutines
+        for owned in reversed(owned_to_close):
+            if id(owned) in closed or not inspect.iscoroutine(owned):
+                continue
+            closed.add(id(owned))
+            # safe_schedule_threadsafe also closes its submitted coroutine when
+            # run_coroutine_threadsafe rejects it.  Treat an already-cleared
+            # frame as transferred cleanup so each coroutine is closed once.
+            if owned.cr_frame is not None:
+                owned.close()
 
     # Propagate the context-local HERMES_HOME override onto the MCP loop.
     # Tasks scheduled via run_coroutine_threadsafe are created INSIDE the
@@ -3876,16 +4006,52 @@ def _run_on_mcp_loop(coro_or_factory, timeout: float = 30):
     # of the selected profile's. Re-establish the override inside the
     # task's own context (task-local — concurrent calls carrying different
     # scopes don't interfere). No-op when no override is active.
-    coro = _wrap_with_home_override(coro)
-    coro = _wrap_with_dashboard_oauth_flow(coro)
+    try:
+        wrapped = _wrap_with_home_override(coro, on_start=_mark_outer_started)
+        if wrapped is not coro:
+            owned_coroutines.append(wrapped)
+        coro = wrapped
+        wrapped = _wrap_with_dashboard_oauth_flow(coro, on_start=_mark_outer_started)
+        if wrapped is not coro:
+            owned_coroutines.append(wrapped)
+        coro = wrapped
+    except BaseException:
+        _close_owned_coroutines()
+        raise
 
-    future = safe_schedule_threadsafe(
-        coro, loop,
-        logger=logger,
-        log_message="MCP scheduling failed",
-    )
-    if future is None:
-        raise RuntimeError("MCP event loop unavailable (failed to schedule)")
+    # Revalidate and schedule in one lock-bound admission transaction.  A
+    # shutdown claimant cannot slip between this check and scheduling.  The
+    # loop and generation are deliberately read only here, after all user code
+    # above has completed.
+    with _lock:
+        loop = _mcp_loop
+        if (
+            _mcp_loop_shutting_down
+            or loop is None
+            or _mcp_generation != admission_generation
+            or loop is not admission_loop
+            or not loop.is_running()
+        ):
+            _close_owned_coroutines()
+            if _mcp_loop_shutting_down:
+                raise MCPShutdownInProgressError("MCP event loop is shutting down")
+            raise RuntimeError("MCP event loop is not running")
+        try:
+            future = safe_schedule_threadsafe(
+                coro, loop,
+                logger=logger,
+                log_message="MCP scheduling failed",
+            )
+        except BaseException:
+            _close_owned_coroutines()
+            raise
+        if future is None:
+            _close_owned_coroutines()
+            raise RuntimeError("MCP event loop unavailable (failed to schedule)")
+        # Keep the admission generation attached to the scheduled operation;
+        # this is useful to callers inspecting a future during teardown and
+        # makes the atomic admission decision explicit.
+        setattr(future, "_mcp_generation", admission_generation)
     start_time = time.monotonic()
     deadline = None if timeout is None else start_time + timeout
 
@@ -4036,7 +4202,34 @@ async def _connect_server(name: str, config: dict) -> MCPServerTask:
         Exception: on connection or initialization failure.
     """
     server = MCPServerTask(name)
-    await server.start(config)
+    claim = _connect_server_claim.get()
+    claim_token = None
+    if claim is not None:
+        claim(server)
+        # ``start()`` creates the long-lived run task by copying this context.
+        # The ownership callback is only for this connection attempt; do not
+        # retain its discovery closure for the server's lifetime.
+        claim_token = _connect_server_claim.set(None)
+    try:
+        await server.start(config)
+    except asyncio.CancelledError:
+        raise
+    except BaseException:
+        # Discovery owns claimed tasks and decides whether a failed start is a
+        # live recoverable park or a terminal failure. Standalone probes have
+        # no revival owner, so they must reap their failed task locally.
+        if claim is None:
+            try:
+                await server.shutdown()
+            except Exception as shutdown_exc:  # noqa: BLE001
+                logger.debug(
+                    "MCP server '%s' shutdown during orphan-reap failed: %s",
+                    name, shutdown_exc,
+                )
+        raise
+    finally:
+        if claim_token is not None:
+            _connect_server_claim.reset(claim_token)
     return server
 
 
@@ -5134,10 +5327,41 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
     Returns list of registered tool names.
     """
     connect_timeout = config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT)
-    server = await asyncio.wait_for(
-        _connect_server(name, config),
-        timeout=connect_timeout,
-    )
+    claimed: List[MCPServerTask] = []
+
+    def _claim_server(created: MCPServerTask) -> None:
+        claimed.append(created)
+
+    claim_token = _connect_server_claim.set(_claim_server)
+    try:
+        server = await asyncio.wait_for(
+            _connect_server(name, config),
+            timeout=connect_timeout,
+        )
+    except BaseException:
+        server = claimed[0] if claimed else None
+        task = server._task if server is not None else None
+        task_cancelling = (
+            task.cancelling()
+            if task is not None and hasattr(task, "cancelling")
+            else 0
+        )
+        if (
+            server is not None
+            and server._error is not None
+            and task is not None
+            and not task.done()
+            and not task_cancelling
+        ):
+            # Recoverable park: the run task deliberately stays alive to
+            # self-probe, so adopt it into the registry for shutdown/revival.
+            with _lock:
+                _servers[name] = server
+        elif server is not None:
+            await server.shutdown()
+        raise
+    finally:
+        _connect_server_claim.reset(claim_token)
     with _lock:
         _server_connecting.discard(name)
         _server_connect_errors.pop(name, None)
@@ -5183,6 +5407,8 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     # Only attempt servers that aren't already connected and are enabled
     # (enabled: false skips the server entirely without removing its config)
     with _lock:
+        if _mcp_loop_shutting_down:
+            raise MCPShutdownInProgressError("MCP event loop is shutting down")
         new_servers = {
             k: v
             for k, v in servers.items()
@@ -5207,6 +5433,19 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
                 _parallel_safe_servers.add(sanitize_mcp_name_component(srv_name))
             else:
                 _parallel_safe_servers.discard(sanitize_mcp_name_component(srv_name))
+        # Keep admission atomic with loop ownership.  _ensure_mcp_loop uses
+        # the re-entrant shared lock, and therefore teardown cannot claim the
+        # loop after the connecting set is mutated but before the loop is
+        # selected.
+        if new_servers:
+            try:
+                _ensure_mcp_loop()
+            except BaseException:
+                # Loop admission failure must roll back the mutation made
+                # above; otherwise a rejected registration is left forever in
+                # the connecting status map.
+                _server_connecting.difference_update(new_servers)
+                raise
 
     for srv in stale_cached:
         _signal_reconnect(srv)
@@ -5214,8 +5453,6 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     if not new_servers:
         return _existing_tool_names()
 
-    # Start the background event loop for MCP connections
-    _ensure_mcp_loop()
 
     async def _discover_one(name: str, cfg: dict) -> List[str]:
         """Connect to a single server and return its registered tool names."""
@@ -5258,6 +5495,14 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         _set_interrupt(False)
     try:
         _run_on_mcp_loop(_discover_all, timeout=120)
+    except BaseException:
+        # Scheduling can fail after admission (for example if the loop closes
+        # underneath a test double).  Never leave names advertised as
+        # connecting when no discovery coroutine owns them.
+        with _lock:
+            for name in new_servers:
+                _server_connecting.discard(name)
+        raise
     finally:
         if _was_interrupted:
             _set_interrupt(True)
@@ -5294,6 +5539,10 @@ def discover_mcp_tools() -> List[str]:
     if not _MCP_AVAILABLE:
         logger.debug("MCP SDK not available -- skipping MCP tool discovery")
         return []
+
+    with _lock:
+        if _mcp_loop_shutting_down:
+            raise MCPShutdownInProgressError("MCP event loop is shutting down")
 
     servers = _load_mcp_config()
     if not servers:
@@ -5701,51 +5950,132 @@ def _reinject_post_build_tools(agent, tools_list: list, name_set: set) -> set:
     return staged_engine_names
 
 
-def shutdown_mcp_servers():
-    """Close all MCP server connections and stop the background loop.
+async def _shutdown_mcp_servers(servers: tuple) -> None:
+    """Signal server tasks to leave their transport contexts."""
+    results = await asyncio.gather(
+        *(server.shutdown() for server in servers),
+        return_exceptions=True,
+    )
+    for server, result in zip(servers, results):
+        if isinstance(result, BaseException):
+            logger.debug("Error closing MCP server '%s': %s", server.name, result)
 
-    Each server Task is signalled to exit its ``async with`` block so that
-    the anyio cancel-scope cleanup happens in the same Task that opened it.
-    All servers are shut down in parallel via ``asyncio.gather``.
-    """
+
+async def _mcp_shutdown_coordinator(servers: tuple, deadline: float) -> bool:
+    """Own the complete shutdown transaction; callers only wait on its future."""
+    remaining = max(0.0, deadline - time.monotonic())
+    shutdown_task = asyncio.create_task(_shutdown_mcp_servers(servers))
+    done, _ = await asyncio.wait({shutdown_task}, timeout=remaining)
+    if not done:
+        shutdown_task.cancel()
+    remaining = max(0.0, deadline - time.monotonic())
+    if not await _drain_mcp_loop_tasks(timeout=remaining):
+        return False
+    # The calling thread stops the loop only after this coordinator future has
+    # completed, so its result cannot be stranded behind loop.stop().
+    return True
+
+
+def _shutdown_wave_done(future) -> None:
+    """Permit a failed wave to be retried once its coordinator is terminal."""
+    global _mcp_shutdown_wave_active
     with _lock:
-        servers_snapshot = list(_servers.values())
+        if (
+            _mcp_shutdown_future is future
+            and _mcp_shutdown_waiters == 0
+            and future.done()
+        ):
+            try:
+                retryable = future.cancelled() or future.exception() is not None
+                if not retryable:
+                    retryable = future.result() is False
+            except BaseException:
+                retryable = True
+            if retryable:
+                _mcp_shutdown_wave_active = False
 
-    # Fast path: nothing to shut down.
-    if not servers_snapshot:
-        _stop_mcp_loop()
-        return
 
-    async def _shutdown():
-        results = await asyncio.gather(
-            *(server.shutdown() for server in servers_snapshot),
-            return_exceptions=True,
-        )
-        for server, result in zip(servers_snapshot, results):
-            if isinstance(result, Exception):
-                logger.debug(
-                    "Error closing MCP server '%s': %s", server.name, result,
-                )
-        with _lock:
-            _servers.clear()
+def _leave_shutdown_wave(future) -> None:
+    """Release one caller; pending coordinators remain authoritative."""
+    global _mcp_shutdown_waiters, _mcp_shutdown_wave_active
+    with _lock:
+        _mcp_shutdown_waiters -= 1
+        if _mcp_shutdown_waiters == 0 and future.done():
+            _shutdown_wave_done(future)
 
+
+def shutdown_mcp_servers():
+    """Coalesce callers onto one loop-owned shutdown under one absolute deadline."""
+    global _mcp_shutdown_servers, _mcp_shutdown_deadline, _mcp_loop_shutting_down
+    global _mcp_shutdown_future, _mcp_finalization_future, _mcp_generation
+    global _mcp_shutdown_waiters, _mcp_shutdown_wave_active
+    from agent.async_utils import safe_schedule_threadsafe
+
+    caller_deadline = time.monotonic() + _MCP_LOOP_DRAIN_TIMEOUT
     with _lock:
         loop = _mcp_loop
-    if loop is not None and loop.is_running():
-        from agent.async_utils import safe_schedule_threadsafe
-        future = safe_schedule_threadsafe(
-            _shutdown(), loop,
-            logger=logger,
-            log_message="MCP shutdown: failed to schedule",
-        )
-        if future is not None:
+        if loop is None:
+            return True
+        if not loop.is_running():
+            # A stopped/closed owner cannot accept a shutdown submission. Only
+            # clear it when its thread and asyncio task set are provably gone;
+            # otherwise preserve ownership and let a later call retry safely.
+            if _discard_stale_mcp_loop_locked():
+                return True
+            return False
+        future = _mcp_shutdown_future
+        # Join an existing wave, including a coordinator that already completed
+        # false.  It is not replaceable until every caller in this wave returns.
+        if not _mcp_shutdown_wave_active:
+            _mcp_shutdown_servers = tuple(_servers.values())
+            _mcp_shutdown_deadline = caller_deadline
+            _mcp_loop_shutting_down = True
+            _mcp_generation += 1
+            _mcp_finalization_future = concurrent.futures.Future()
+            coordinator_coro = _mcp_shutdown_coordinator(
+                _mcp_shutdown_servers, caller_deadline
+            )
             try:
-                future.result(timeout=15)
-            except BaseException as exc:
-                logger.debug("Error during MCP shutdown: %s", exc)
+                future = safe_schedule_threadsafe(
+                    coordinator_coro,
+                    loop,
+                    logger=logger,
+                    log_message="MCP shutdown: failed to schedule",
+                )
+            except BaseException:
+                coordinator_coro.close()
+                future = None
+            if future is None:
+                coordinator_coro.close()
+                # No coordinator was admitted, so undo the claim immediately.
+                _mcp_loop_shutting_down = False
+                _mcp_shutdown_servers = ()
+                _mcp_shutdown_deadline = None
+                finalization = _mcp_finalization_future
+                _mcp_finalization_future = None
+                if finalization is not None and not finalization.done():
+                    finalization.set_result(False)
+                return False
+            _mcp_shutdown_future = future
+            _mcp_shutdown_wave_active = True
+        _mcp_shutdown_waiters += 1
+        future = _mcp_shutdown_future
+        assert future is not None
+        future.add_done_callback(_shutdown_wave_done)
 
-    _stop_mcp_loop()
-
+    try:
+        clean = bool(future.result(timeout=max(0.0, caller_deadline - time.monotonic())))
+        if clean:
+            return _finish_mcp_loop(future, caller_deadline)
+        return False
+    except concurrent.futures.TimeoutError:
+        logger.warning("MCP loop shutdown reached its %.1fs deadline", _MCP_LOOP_DRAIN_TIMEOUT)
+        return False
+    except BaseException as exc:
+        logger.warning("Error during MCP shutdown: %s", exc)
+        return False
+    finally:
+        _leave_shutdown_wave(future)
 
 def _kill_orphaned_mcp_children(
     include_active: bool = False,
@@ -5887,27 +6217,114 @@ def _stop_mcp_loop_if_idle() -> bool:
     return _stop_mcp_loop(only_if_idle=True)
 
 
+async def _drain_mcp_loop_tasks(
+    *, timeout: float = _MCP_LOOP_DRAIN_TIMEOUT,
+) -> bool:
+    """Cancel and reap pending tasks while their owning loop is open."""
+    current = asyncio.current_task()
+    pending = [t for t in asyncio.all_tasks() if t is not current and not t.done()]
+    if not pending:
+        return True
+    for task in pending:
+        task.cancel()
+    done, still_pending = await asyncio.wait(pending, timeout=timeout)
+    for task in done:
+        if task.cancelled():
+            continue
+        try:
+            task.exception()
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.debug("Pending MCP loop task ended during shutdown: %s", exc)
+    if still_pending:
+        logger.warning(
+            "%d MCP loop task(s) still pending after %.1fs drain",
+            len(still_pending), timeout,
+        )
+        return False
+    return True
+
+
+def _finish_mcp_loop(future, deadline: float) -> bool:
+    """Finalize an already-completed coordinator; never schedule peer drains."""
+    global _mcp_loop, _mcp_thread, _mcp_loop_shutting_down
+    global _mcp_shutdown_servers, _mcp_shutdown_deadline, _mcp_shutdown_future
+    global _mcp_shutdown_finalizing, _mcp_finalization_future
+    global _mcp_shutdown_wave_active
+    with _lock:
+        loop = _mcp_loop
+        thread = _mcp_thread
+        if loop is None or _mcp_shutdown_future is not future:
+            return loop is None
+        remaining = max(0.0, deadline - time.monotonic())
+        if _mcp_shutdown_finalizing:
+            finalization = _mcp_finalization_future
+            # Do not wait while holding the shared lock.
+            owner = False
+        else:
+            _mcp_shutdown_finalizing = True
+            finalization = _mcp_finalization_future
+            owner = True
+    if not owner:
+        if finalization is None:
+            return False
+        try:
+            return bool(finalization.result(timeout=remaining))
+        except (concurrent.futures.TimeoutError, BaseException):
+            return False
+    if thread is not None:
+        try:
+            loop.call_soon_threadsafe(loop.stop)
+        except RuntimeError:
+            with _lock:
+                _mcp_shutdown_finalizing = False
+                if _mcp_finalization_future is not None and not _mcp_finalization_future.done():
+                    _mcp_finalization_future.set_result(False)
+            return False
+        thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        if thread.is_alive():
+            with _lock:
+                _mcp_shutdown_finalizing = False
+                if _mcp_finalization_future is not None and not _mcp_finalization_future.done():
+                    _mcp_finalization_future.set_result(False)
+            return False
+    if loop is not None and not loop.is_closed():
+        try:
+            loop.close()
+        except Exception:
+            logger.warning("Error closing MCP event loop", exc_info=True)
+            with _lock:
+                _mcp_shutdown_finalizing = False
+                if _mcp_finalization_future is not None and not _mcp_finalization_future.done():
+                    _mcp_finalization_future.set_result(False)
+            return False
+    with _lock:
+        if _mcp_loop is not loop or _mcp_shutdown_future is not future:
+            return False
+        _servers.clear()
+        _server_connecting.clear()
+        _mcp_loop = None
+        _mcp_thread = None
+        _mcp_loop_shutting_down = False
+        _mcp_shutdown_servers = ()
+        _mcp_shutdown_deadline = None
+        _mcp_shutdown_future = None
+        _mcp_shutdown_finalizing = False
+        _mcp_shutdown_wave_active = False
+        finalization = _mcp_finalization_future
+        _mcp_finalization_future = None
+        if finalization is not None and not finalization.done():
+            finalization.set_result(True)
+    # Only reap children after the loop and its thread are unquestionably gone.
+    _kill_orphaned_mcp_children(include_active=True)
+    return True
+
+
 def _stop_mcp_loop(*, only_if_idle: bool = False) -> bool:
-    """Stop the background event loop and join its thread."""
-    global _mcp_loop, _mcp_thread
+    """Request the shared shutdown, optionally only for an idle loop."""
     with _lock:
         if only_if_idle and (_servers or _server_connecting):
             logger.debug("Leaving MCP event loop running; active servers are registered or connecting")
             return False
-        loop = _mcp_loop
-        thread = _mcp_thread
-        _mcp_loop = None
-        _mcp_thread = None
-    if loop is not None:
-        loop.call_soon_threadsafe(loop.stop)
-        if thread is not None:
-            thread.join(timeout=5)
-        try:
-            loop.close()
-        except Exception:
-            pass
-        # After closing the loop, any stdio subprocesses that survived the
-        # graceful shutdown are now orphaned — include active PIDs too
-        # since the loop is gone and no session can still be in flight.
-        _kill_orphaned_mcp_children(include_active=True)
-    return True
+    return shutdown_mcp_servers()
