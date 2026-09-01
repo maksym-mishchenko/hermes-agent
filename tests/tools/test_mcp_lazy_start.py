@@ -614,3 +614,84 @@ def test_public_cache_rollback_preserves_same_string_alias_aba(monkeypatch):
         assert token.generation == replacement_generation[-1]
     finally:
         registry.restore_toolset_alias(server, f"mcp-{server}", None)
+
+
+def test_public_cache_rollback_preserves_concurrent_utility_replacement_10x(
+    monkeypatch,
+):
+    """A utility replacement racing a failed wrapper is never rolled back."""
+    from tools.registry import registry
+
+    original_register = registry.register
+    monkeypatch.setattr(mcp, "_MCP_AVAILABLE", True)
+    monkeypatch.setattr(
+        "tools.mcp_schema_cache.config_fingerprint", lambda _cfg: "fp"
+    )
+
+    for attempt in range(10):
+        server = f"utility-registry-race-{attempt}"
+        utility = mcp._build_utility_schemas(server)[0]
+        tool_name = utility["schema"]["name"]
+        entry = {"fingerprint": "fp", "tools": [], "utility_tools": [utility]}
+        monkeypatch.setattr(
+            "tools.mcp_schema_cache.get_cached_entry",
+            lambda _name, _fp, entry=entry: entry,
+        )
+
+        def register_and_replace(*args, **kwargs):
+            written = original_register(*args, **kwargs)
+            if kwargs.get("name") == tool_name:
+                original_register(
+                    name=tool_name,
+                    toolset="foreign",
+                    schema={},
+                    handler=lambda _args: "foreign",
+                    override=True,
+                )
+                raise RuntimeError("utility replacement barrier")
+            return written
+
+        monkeypatch.setattr(registry, "register", register_and_replace)
+        with pytest.raises(RuntimeError, match="utility replacement barrier"):
+            mcp.register_mcp_servers({server: {"command": "unused", "lazy": True}})
+        assert registry.get_toolset_for_tool(tool_name) == "foreign"
+        registry.restore_registration(tool_name, registry.snapshot_registration(tool_name), None)
+
+
+@pytest.mark.parametrize("utility", [False, True])
+def test_cache_rollback_removes_owned_provenance_after_post_write_failure_10x(
+    monkeypatch, utility
+):
+    """Post-write tracking failures clean owned provenance on both paths."""
+    from tools.registry import registry
+
+    original_track = mcp._track_mcp_tool_server
+    monkeypatch.setattr(mcp, "_MCP_AVAILABLE", True)
+    for attempt in range(10):
+        server = f"provenance-failure-{utility}-{attempt}"
+        if utility:
+            utility_entry = mcp._build_utility_schemas(server)[0]
+            entry = {
+                "fingerprint": "fp", "tools": [], "utility_tools": [utility_entry]
+            }
+            registered_name = utility_entry["schema"]["name"]
+        else:
+            registered_name = f"mcp__{server}__tool"
+            entry = {
+                "fingerprint": "fp",
+                "tools": [{"name": "tool", "description": "", "inputSchema": {}}],
+                "utility_tools": [],
+            }
+
+        def track_then_fail(tool_name, server_name):
+            original_track(tool_name, server_name)
+            raise RuntimeError("provenance post-write barrier")
+
+        monkeypatch.setattr(mcp, "_track_mcp_tool_server", track_then_fail)
+        with pytest.raises(RuntimeError, match="provenance post-write barrier"):
+            mcp._register_from_cache_sync(server, {"lazy": True}, entry, fingerprint="fp")
+        assert registered_name not in mcp._mcp_tool_server_names
+        if registry.snapshot_registration(registered_name) is not None:
+            registry.restore_registration(
+                registered_name, registry.snapshot_registration(registered_name), None
+            )

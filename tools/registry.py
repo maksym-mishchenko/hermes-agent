@@ -547,6 +547,11 @@ class ToolRegistry:
             target = self._tools if scope is None else self._scoped_tools.get(scope, {})
             return target.get(name)
 
+    def snapshot_generation(self) -> int:
+        """Return the registry mutation generation for ownership checks."""
+        with self._lock:
+            return self._generation
+
     def get_registered_toolset_names(self) -> List[str]:
         """Return sorted unique toolset names present in the registry."""
         return sorted({entry.toolset for entry in self._snapshot_entries()})

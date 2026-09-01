@@ -5006,6 +5006,7 @@ _parallel_safe_servers: set = set()
 # name captured at registration time so policy and capability checks never rely
 # on parsing or re-sanitizing the generated name.
 _mcp_tool_server_names: Dict[str, str] = {}
+_mcp_tool_server_generations: Dict[str, int] = {}
 
 # Dedicated event loop running in a background daemon thread.
 _mcp_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -6840,10 +6841,35 @@ _UTILITY_CAPABILITY_ATTRS = {
 }
 
 
-def _track_mcp_tool_server(tool_name: str, server_name: str) -> None:
-    """Remember the exact raw MCP server that registered *tool_name*."""
+class _MCPProvenanceToken:
+    """Identity-bearing token for one MCP provenance write."""
+
+    __slots__ = ("tool_name", "server_name", "generation")
+
+    def __init__(self, tool_name: str, server_name: str, generation: int) -> None:
+        self.tool_name = tool_name
+        self.server_name = server_name
+        self.generation = generation
+
+
+def _track_mcp_tool_server(
+    tool_name: str, server_name: str
+) -> _MCPProvenanceToken:
+    """Remember the exact raw MCP server and return its ownership token."""
     with _lock:
+        generation = _mcp_tool_server_generations.get(tool_name, 0) + 1
         _mcp_tool_server_names[tool_name] = server_name
+        _mcp_tool_server_generations[tool_name] = generation
+        return _MCPProvenanceToken(tool_name, server_name, generation)
+
+
+def _snapshot_mcp_tool_server(tool_name: str) -> tuple[Optional[str], int]:
+    """Return the current MCP provenance value and generation."""
+    with _lock:
+        return (
+            _mcp_tool_server_names.get(tool_name),
+            _mcp_tool_server_generations.get(tool_name, 0),
+        )
 
 
 def _forget_mcp_tool_server(tool_name: str) -> None:
@@ -7213,6 +7239,7 @@ class _MCPRegistrationJournal:
         self.registry_entries: Dict[str, tuple] = {}
         self.aliases: Dict[str, tuple] = {}
         self.maps: Dict[tuple, tuple] = {}
+        self.provenance: Dict[str, tuple] = {}
         self.set_membership: Dict[tuple, tuple] = {}
 
     @staticmethod
@@ -7264,8 +7291,34 @@ class _MCPRegistrationJournal:
             before = self._state(mapping, key)
         self.maps[slot] = (before, self._state(mapping, key))
 
-    def record_provenance(self, name: str) -> None:
-        self.record_map("provenance", _mcp_tool_server_names, name)
+    def capture_provenance_before(self, name: str) -> None:
+        """Capture provenance prestate once for a registration transaction."""
+        if name not in self.provenance:
+            before, generation = _snapshot_mcp_tool_server(name)
+            self.provenance[name] = (
+                before if before is not None else _MISSING,
+                generation,
+                _MISSING,
+            )
+
+    def record_provenance_owned_after(
+        self,
+        name: str,
+        server_name: str,
+        token: Optional[_MCPProvenanceToken] = None,
+    ) -> None:
+        """Record only the exact provenance state owned by this write."""
+        self.capture_provenance_before(name)
+        before, before_generation, _ = self.provenance[name]
+        if token is None:
+            value, generation = _snapshot_mcp_tool_server(name)
+            # A wrapper may raise after _track_mcp_tool_server mutates the map,
+            # so the return token is lost.  The single-generation transition
+            # is the ownership contract for that exceptional path; a second
+            # write is foreign and must not be claimed.
+            if value == server_name and generation == before_generation + 1:
+                token = _MCPProvenanceToken(name, server_name, generation)
+        self.provenance[name] = (before, before_generation, token or _MISSING)
 
     def record_set(self, label: str, values: set, key) -> None:
         slot = (label, key)
@@ -7304,6 +7357,22 @@ class _MCPRegistrationJournal:
                     mapping.pop(key, None)
                 else:
                     mapping[key] = before
+            for name, (before, before_generation, post) in self.provenance.items():
+                if post is _MISSING:
+                    continue
+                value, generation = _snapshot_mcp_tool_server(name)
+                if (
+                    value != post.server_name
+                    or generation != post.generation
+                ):
+                    continue
+                if before is _MISSING:
+                    _mcp_tool_server_names.pop(name, None)
+                else:
+                    _mcp_tool_server_names[name] = before
+                _mcp_tool_server_generations[name] = max(
+                    generation + 1, before_generation + 1
+                )
             for (label, key), (before, post) in self.set_membership.items():
                 values = _parallel_safe_servers if label == "parallel" else _server_connecting
                 if (key in values) != post:
@@ -7421,6 +7490,7 @@ def _register_from_cache_sync_impl(
             )
             continue
         journal.record_registry(registry_name)
+        registry_generation = registry.snapshot_generation()
         written_entry = None
         try:
             written_entry = registry.register(
@@ -7434,15 +7504,30 @@ def _register_from_cache_sync_impl(
             )
         finally:
             current = registry.snapshot_registration(registry_name)
-            post = written_entry
-            if post is None and current is not None and current.toolset == toolset_name:
+            post = _MISSING
+            if written_entry is not None:
+                if (
+                    written_entry.toolset == toolset_name
+                    and current is written_entry
+                ):
+                    post = written_entry
+            elif (
+                current is not None
+                and current.toolset == toolset_name
+                and registry.snapshot_generation() == registry_generation + 1
+            ):
                 post = current
             journal.record_registry(registry_name, post if post is not None else _MISSING)
         if registry.get_toolset_for_tool(registry_name) != toolset_name:
             continue
-        journal.record_provenance(registry_name)
-        _track_mcp_tool_server(registry_name, name)
-        journal.record_provenance(registry_name)
+        journal.capture_provenance_before(registry_name)
+        provenance_token = None
+        try:
+            provenance_token = _track_mcp_tool_server(registry_name, name)
+        finally:
+            journal.record_provenance_owned_after(
+                registry_name, name, provenance_token
+            )
         registered_names.append(registry_name)
 
     handler_factories = {
@@ -7465,6 +7550,7 @@ def _register_from_cache_sync_impl(
         if existing_toolset and existing_toolset != toolset_name:
             continue
         journal.record_registry(util_name)
+        registry_generation = registry.snapshot_generation()
         written_entry = None
         try:
             written_entry = registry.register(
@@ -7477,12 +7563,29 @@ def _register_from_cache_sync_impl(
                 description=schema.get("description") or "",
             )
         finally:
-            journal.record_registry(util_name, written_entry)
+            current = registry.snapshot_registration(util_name)
+            post = _MISSING
+            if written_entry is not None:
+                if (
+                    written_entry.toolset == toolset_name
+                    and current is written_entry
+                ):
+                    post = written_entry
+            elif (
+                current is not None
+                and current.toolset == toolset_name
+                and registry.snapshot_generation() == registry_generation + 1
+            ):
+                post = current
+            journal.record_registry(util_name, post)
         if registry.get_toolset_for_tool(util_name) != toolset_name:
             continue
-        journal.record_provenance(util_name)
-        _track_mcp_tool_server(util_name, name)
-        journal.record_provenance(util_name)
+        journal.capture_provenance_before(util_name)
+        provenance_token = None
+        try:
+            provenance_token = _track_mcp_tool_server(util_name, name)
+        finally:
+            journal.record_provenance_owned_after(util_name, name, provenance_token)
         registered_names.append(util_name)
 
     if registered_names:
