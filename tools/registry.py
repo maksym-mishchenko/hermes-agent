@@ -582,6 +582,18 @@ class ToolRegistry:
         with self._lock:
             return dict(self._toolset_aliases)
 
+    def snapshot_toolset_alias(self, alias: str) -> Optional[_AliasRegistration]:
+        """Return the current identity token for an alias, if registered."""
+        with self._lock:
+            value = self._toolset_aliases.get(alias)
+            if value is None:
+                return None
+            return _AliasRegistration(
+                alias,
+                value,
+                self._toolset_alias_generations.get(alias, 0),
+            )
+
     def get_toolset_alias_target(self, alias: str) -> Optional[str]:
         """Return the canonical toolset name for an alias, or None."""
         with self._lock:
@@ -1049,16 +1061,6 @@ class ToolRegistry:
                         self._toolset_checks.pop(toolset, None)
                     else:
                         self._toolset_checks[toolset] = check_fn
-                if not surviving and not any(
-                    entry.toolset == toolset
-                    for entries in self._scoped_tools.values()
-                    for entry in entries.values()
-                ):
-                    self._toolset_aliases = {
-                        alias: target
-                        for alias, target in self._toolset_aliases.items()
-                        if target != toolset
-                    }
             self._generation += 1
         logger.debug("Restored tool registration: %s", name)
         return True

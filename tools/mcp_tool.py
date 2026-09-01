@@ -5428,12 +5428,16 @@ def _run_on_mcp_loop(
             admission_loop = _mcp_loop
         if (
             _mcp_loop_shutting_down
+            or (
+                admission_generation is not None
+                and admission_generation != _mcp_generation
+            )
             or admission_loop is None
             or not admission_loop.is_running()
         ):
             if inspect.iscoroutine(coro_or_factory):
                 coro_or_factory.close()
-            if _mcp_loop_shutting_down:
+            if _mcp_loop_shutting_down or _mcp_generation != admission_generation:
                 raise MCPShutdownInProgressError("MCP event loop is shutting down")
             raise RuntimeError("MCP event loop is not running")
 
@@ -5499,7 +5503,7 @@ def _run_on_mcp_loop(
             or not loop.is_running()
         ):
             _close_owned_coroutines()
-            if _mcp_loop_shutting_down:
+            if _mcp_loop_shutting_down or _mcp_generation != admission_generation:
                 raise MCPShutdownInProgressError("MCP event loop is shutting down")
             raise RuntimeError("MCP event loop is not running")
         try:
@@ -7227,19 +7231,30 @@ class _MCPRegistrationJournal:
     def capture_alias_before(self, alias: str) -> None:
         """Capture an alias's pre-transaction value once."""
         if alias not in self.aliases:
+            token = self.registry.snapshot_toolset_alias(alias)
             self.aliases[alias] = (
-                self.registry.get_registered_toolset_aliases().get(alias, _MISSING),
+                token.value if token is not None else _MISSING,
+                token.generation if token is not None else 0,
                 _MISSING,
             )
 
     def capture_alias_owned_after(self, alias: str, registration=None) -> None:
         """Record the exact value/token written by this transaction."""
-        before = self.aliases.get(alias, (_MISSING,))[0]
+        before, before_generation, _ = self.aliases.get(
+            alias, (_MISSING, 0, _MISSING)
+        )
+        if registration is None:
+            # A wrapper can raise after the registry write, so no return token
+            # reaches us. Claim that write only when it is exactly the next
+            # generation; two writes (including same-string ABA replacement)
+            # are deliberately treated as foreign and left untouched.
+            candidate = self.registry.snapshot_toolset_alias(alias)
+            if candidate is not None and candidate.generation == before_generation + 1:
+                registration = candidate
         self.aliases[alias] = (
             before,
-            registration
-            if registration is not None
-            else self.registry.get_registered_toolset_aliases().get(alias, _MISSING),
+            before_generation,
+            registration if registration is not None else _MISSING,
         )
 
     def record_map(self, label: str, mapping, key) -> None:
@@ -7262,7 +7277,7 @@ class _MCPRegistrationJournal:
         return key not in mapping if post is _MISSING else mapping.get(key) is post
 
     def rollback(self) -> None:
-        for alias, (before, post) in self.aliases.items():
+        for alias, (before, _before_generation, post) in self.aliases.items():
             if post is not _MISSING:
                 self.registry.restore_toolset_alias(
                     alias, post, None if before is _MISSING else before
@@ -7406,16 +7421,23 @@ def _register_from_cache_sync_impl(
             )
             continue
         journal.record_registry(registry_name)
-        written_entry = registry.register(
-            name=registry_name,
-            toolset=toolset_name,
-            schema=schema,
-            handler=_make_tool_handler(name, raw_name, tool_timeout),
-            check_fn=check_fn,
-            is_async=False,
-            description=schema["description"],
-        )
-        journal.record_registry(registry_name, written_entry)
+        written_entry = None
+        try:
+            written_entry = registry.register(
+                name=registry_name,
+                toolset=toolset_name,
+                schema=schema,
+                handler=_make_tool_handler(name, raw_name, tool_timeout),
+                check_fn=check_fn,
+                is_async=False,
+                description=schema["description"],
+            )
+        finally:
+            current = registry.snapshot_registration(registry_name)
+            post = written_entry
+            if post is None and current is not None and current.toolset == toolset_name:
+                post = current
+            journal.record_registry(registry_name, post if post is not None else _MISSING)
         if registry.get_toolset_for_tool(registry_name) != toolset_name:
             continue
         journal.record_provenance(registry_name)

@@ -570,3 +570,47 @@ def test_public_cache_rollback_preserves_concurrent_alias_replacement(monkeypatc
         assert registry.get_toolset_alias_target(server) == "foreign-alias"
     finally:
         registry.restore_toolset_alias(server, "foreign-alias", None)
+
+
+def test_public_cache_rollback_preserves_same_string_alias_aba(monkeypatch):
+    """A stale rollback cannot remove a replacement with the same target."""
+    from tools.registry import registry
+
+    server, tool_name = "cas-alias-aba", "cas_alias_aba_tool"
+    original_alias = registry.register_toolset_alias
+    replacement_generation = []
+
+    def alias_and_replace(alias, toolset):
+        owned = original_alias(alias, toolset)
+        if alias == server:
+            replacement = original_alias(alias, toolset)
+            replacement_generation.append(replacement.generation)
+        return owned
+
+    monkeypatch.setattr(registry, "register_toolset_alias", alias_and_replace)
+    monkeypatch.setattr(mcp, "_MCP_AVAILABLE", True)
+    monkeypatch.setattr(
+        "tools.mcp_schema_cache.config_fingerprint", lambda _cfg: "fp"
+    )
+    monkeypatch.setattr(
+        "tools.mcp_schema_cache.get_cached_entry",
+        lambda _name, _fp: _cas_cache_entry(tool_name),
+    )
+    original_cached = mcp._register_from_cache_sync
+
+    def register_then_fail(name, config, entry, *, fingerprint=None, journal=None):
+        original_cached(
+            name, config, entry, fingerprint=fingerprint, journal=journal
+        )
+        raise RuntimeError("alias ABA rollback barrier")
+
+    monkeypatch.setattr(mcp, "_register_from_cache_sync", register_then_fail)
+    try:
+        with pytest.raises(RuntimeError, match="alias ABA rollback barrier"):
+            mcp.register_mcp_servers({server: {"command": "unused", "lazy": True}})
+        assert registry.get_toolset_alias_target(server) == f"mcp-{server}"
+        token = registry.snapshot_toolset_alias(server)
+        assert token is not None
+        assert token.generation == replacement_generation[-1]
+    finally:
+        registry.restore_toolset_alias(server, f"mcp-{server}", None)
