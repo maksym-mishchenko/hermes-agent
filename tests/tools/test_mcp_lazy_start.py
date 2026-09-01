@@ -306,6 +306,88 @@ class TestLazyFirstUseConnect:
 
 
 class TestCacheLoadDescriptionScan:
+    def test_cache_registration_partial_exception_is_transactional(self, monkeypatch):
+        from tools.registry import registry
+
+        entry = {
+            "fingerprint": "abc",
+            "tools": [
+                {"name": "first", "description": "", "inputSchema": {}},
+                {"name": "second", "description": "", "inputSchema": {}},
+            ],
+            "utility_tools": [],
+        }
+        before_entries = {item.name: item for item in registry.get_all_entries()}
+        before_aliases = registry.get_registered_toolset_aliases()
+        before_provenance = dict(mcp._mcp_tool_server_names)
+        original_convert = mcp._convert_mcp_schema
+        calls = 0
+
+        def convert(name, tool):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("partial cache failure")
+            return original_convert(name, tool)
+
+        monkeypatch.setattr(mcp, "_convert_mcp_schema", convert)
+        try:
+            with pytest.raises(RuntimeError, match="partial cache failure"):
+                mcp._register_from_cache_sync(
+                    "partial", {"command": "unused", "lazy": True}, entry,
+                    fingerprint="abc",
+                )
+            assert {item.name: item for item in registry.get_all_entries()} == before_entries
+            assert registry.get_registered_toolset_aliases() == before_aliases
+            assert mcp._mcp_tool_server_names == before_provenance
+            assert "partial" not in mcp._lazy_server_configs
+            assert "partial" not in mcp._lazy_server_fingerprints
+            assert "partial" not in mcp._lazy_server_tool_names
+        finally:
+            for name in ("mcp_partial_first", "mcp_partial_second"):
+                if registry.snapshot_registration(name) is not None:
+                    registry.deregister(name)
+            mcp._mcp_tool_server_names.pop("mcp_partial_first", None)
+
+    def test_scheduler_rejection_rolls_back_real_cached_registration(self, monkeypatch):
+        from tools.registry import registry
+
+        entry = {
+            "fingerprint": "fp",
+            "tools": [
+                {"name": "browser_navigate", "description": "Navigate", "inputSchema": {}},
+            ],
+            "utility_tools": [],
+        }
+        before_entries = {item.name: item for item in registry.get_all_entries()}
+        before_aliases = registry.get_registered_toolset_aliases()
+        before_provenance = dict(mcp._mcp_tool_server_names)
+        monkeypatch.setattr(mcp, "_MCP_AVAILABLE", True)
+        monkeypatch.setattr("tools.mcp_schema_cache.config_fingerprint", lambda _cfg: "fp")
+        monkeypatch.setattr("tools.mcp_schema_cache.get_cached_entry", lambda _name, _fp: entry)
+        monkeypatch.setattr(mcp, "_ensure_mcp_loop", lambda: None)
+        monkeypatch.setattr(
+            mcp, "_run_on_mcp_loop",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("rejected")),
+        )
+        try:
+            with pytest.raises(RuntimeError, match="rejected"):
+                mcp.register_mcp_servers({
+                    "lazy": {"command": "unused", "lazy": True},
+                    "eager": {"command": "unused"},
+                })
+            assert {item.name: item for item in registry.get_all_entries()} == before_entries
+            assert registry.get_registered_toolset_aliases() == before_aliases
+            assert mcp._mcp_tool_server_names == before_provenance
+            assert "lazy" not in mcp._lazy_server_configs
+            assert "lazy" not in mcp._lazy_server_fingerprints
+            assert "lazy" not in mcp._lazy_server_tool_names
+            assert not mcp._server_connecting
+        finally:
+            if registry.snapshot_registration("mcp_lazy_browser_navigate") is not None:
+                registry.deregister("mcp_lazy_browser_navigate")
+            mcp._mcp_tool_server_names.pop("mcp_lazy_browser_navigate", None)
+
     def test_scan_runs_on_cache_load_path(self):
         # Defense-in-depth: the cache file is user-writable JSON, so the
         # cache-load registration path must run the same injection scan as
@@ -318,6 +400,80 @@ class TestCacheLoadDescriptionScan:
             mcp._register_from_cache_sync("playwright", config, entry)
 
         mock_scan.assert_called_once_with("playwright", "browser_navigate", "Navigate")
+
+
+    @pytest.mark.parametrize("failure_after", [1, 2, 3, 4])
+    def test_utility_failure_after_each_write_restores_full_state(
+        self, monkeypatch, failure_after
+    ):
+        from tools.registry import registry
+
+        name = f"utility_failure_{failure_after}"
+        entry = {"fingerprint": "fp", "tools": [], "utility_tools": mcp._build_utility_schemas(name)}
+        before_entries = {item.name: item for item in registry.get_all_entries()}
+        before_aliases = registry.get_registered_toolset_aliases()
+        before_maps = {
+            "provenance": dict(mcp._mcp_tool_server_names),
+            "configs": dict(mcp._lazy_server_configs),
+            "fingerprints": dict(mcp._lazy_server_fingerprints),
+            "tool_names": dict(mcp._lazy_server_tool_names),
+            "trust": dict(mcp._server_trust_levels),
+            "hints": dict(mcp._tool_read_only_hints),
+        }
+        before_sets = {
+            "connecting": set(mcp._server_connecting),
+            "parallel": set(mcp._parallel_safe_servers),
+        }
+        original_register = registry.register
+        writes = 0
+
+        def register_then_fail(**kwargs):
+            nonlocal writes
+            result = original_register(**kwargs)
+            if kwargs["name"].startswith(f"mcp__{name}__"):
+                writes += 1
+                if writes == failure_after:
+                    raise RuntimeError("utility registration failure")
+            return result
+
+        monkeypatch.setattr(registry, "register", register_then_fail)
+        with pytest.raises(RuntimeError, match="utility registration failure"):
+            mcp._register_from_cache_sync(name, {"lazy": True}, entry, fingerprint="fp")
+
+        assert {item.name: item for item in registry.get_all_entries()} == before_entries
+        assert registry.get_registered_toolset_aliases() == before_aliases
+        assert dict(mcp._mcp_tool_server_names) == before_maps["provenance"]
+        assert dict(mcp._lazy_server_configs) == before_maps["configs"]
+        assert dict(mcp._lazy_server_fingerprints) == before_maps["fingerprints"]
+        assert dict(mcp._lazy_server_tool_names) == before_maps["tool_names"]
+        assert dict(mcp._server_trust_levels) == before_maps["trust"]
+        assert dict(mcp._tool_read_only_hints) == before_maps["hints"]
+        assert set(mcp._server_connecting) == before_sets["connecting"]
+        assert set(mcp._parallel_safe_servers) == before_sets["parallel"]
+
+    @pytest.mark.parametrize("preexisting", [False, True])
+    def test_alias_rollback_removes_absent_or_restores_preexisting(self, monkeypatch, preexisting):
+        from tools.registry import registry
+
+        name = f"alias_rollback_{preexisting}"
+        old_target = "old-toolset"
+        if preexisting:
+            registry.register_toolset_alias(name, old_target)
+        entry = {"fingerprint": "fp", "tools": [], "utility_tools": mcp._build_utility_schemas(name)}
+        original_register = registry.register_toolset_alias
+
+        def register_alias_then_fail(alias, toolset):
+            original_register(alias, toolset)
+            raise RuntimeError("alias failure")
+
+        monkeypatch.setattr(registry, "register_toolset_alias", register_alias_then_fail)
+        try:
+            with pytest.raises(RuntimeError, match="alias failure"):
+                mcp._register_from_cache_sync(name, {"lazy": True}, entry, fingerprint="fp")
+            assert registry.get_toolset_alias_target(name) == (old_target if preexisting else None)
+        finally:
+            if preexisting:
+                registry.restore_toolset_alias(name, old_target, None)
 
 
 class TestResolveServerLazy:

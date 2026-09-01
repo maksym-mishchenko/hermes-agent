@@ -572,6 +572,23 @@ class ToolRegistry:
         with self._lock:
             return self._toolset_aliases.get(alias)
 
+    def restore_toolset_alias(
+        self,
+        alias: str,
+        current: Optional[str],
+        previous: Optional[str],
+    ) -> bool:
+        """CAS-restore an alias after an aborted registration transaction."""
+        with self._lock:
+            if self._toolset_aliases.get(alias) != current:
+                return False
+            if previous is None:
+                self._toolset_aliases.pop(alias, None)
+            else:
+                self._toolset_aliases[alias] = previous
+            self._generation += 1
+            return True
+
     # ------------------------------------------------------------------
     # Registration
     # ------------------------------------------------------------------
