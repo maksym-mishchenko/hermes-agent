@@ -7215,11 +7215,14 @@ class _MCPRegistrationJournal:
     def _state(mapping, key):
         return mapping[key] if key in mapping else _MISSING
 
-    def record_registry(self, name: str) -> None:
+    def record_registry(self, name: str, post=None) -> None:
         before = self.registry_entries.get(name, (_MISSING,))[0]
         if before is _MISSING:
             before = self.registry.snapshot_registration(name)
-        self.registry_entries[name] = (before, self.registry.snapshot_registration(name))
+        self.registry_entries[name] = (
+            before,
+            post if post is not None else self.registry.snapshot_registration(name),
+        )
 
     def capture_alias_before(self, alias: str) -> None:
         """Capture an alias's pre-transaction value once."""
@@ -7229,12 +7232,14 @@ class _MCPRegistrationJournal:
                 _MISSING,
             )
 
-    def capture_alias_owned_after(self, alias: str) -> None:
-        """Record the exact value written by this transaction."""
+    def capture_alias_owned_after(self, alias: str, registration=None) -> None:
+        """Record the exact value/token written by this transaction."""
         before = self.aliases.get(alias, (_MISSING,))[0]
         self.aliases[alias] = (
             before,
-            self.registry.get_registered_toolset_aliases().get(alias, _MISSING),
+            registration
+            if registration is not None
+            else self.registry.get_registered_toolset_aliases().get(alias, _MISSING),
         )
 
     def record_map(self, label: str, mapping, key) -> None:
@@ -7258,10 +7263,9 @@ class _MCPRegistrationJournal:
 
     def rollback(self) -> None:
         for alias, (before, post) in self.aliases.items():
-            current = self.registry.get_registered_toolset_aliases().get(alias, _MISSING)
-            if post is not _MISSING and current is post:
+            if post is not _MISSING:
                 self.registry.restore_toolset_alias(
-                    alias, current, None if before is _MISSING else before
+                    alias, post, None if before is _MISSING else before
                 )
         for name, (before, post) in self.registry_entries.items():
             current = self.registry.snapshot_registration(name)
@@ -7402,7 +7406,7 @@ def _register_from_cache_sync_impl(
             )
             continue
         journal.record_registry(registry_name)
-        registry.register(
+        written_entry = registry.register(
             name=registry_name,
             toolset=toolset_name,
             schema=schema,
@@ -7411,7 +7415,7 @@ def _register_from_cache_sync_impl(
             is_async=False,
             description=schema["description"],
         )
-        journal.record_registry(registry_name)
+        journal.record_registry(registry_name, written_entry)
         if registry.get_toolset_for_tool(registry_name) != toolset_name:
             continue
         journal.record_provenance(registry_name)
@@ -7439,8 +7443,9 @@ def _register_from_cache_sync_impl(
         if existing_toolset and existing_toolset != toolset_name:
             continue
         journal.record_registry(util_name)
+        written_entry = None
         try:
-            registry.register(
+            written_entry = registry.register(
                 name=util_name,
                 toolset=toolset_name,
                 schema=schema,
@@ -7450,7 +7455,7 @@ def _register_from_cache_sync_impl(
                 description=schema.get("description") or "",
             )
         finally:
-            journal.record_registry(util_name)
+            journal.record_registry(util_name, written_entry)
         if registry.get_toolset_for_tool(util_name) != toolset_name:
             continue
         journal.record_provenance(util_name)
@@ -7460,10 +7465,11 @@ def _register_from_cache_sync_impl(
 
     if registered_names:
         journal.capture_alias_before(name)
+        alias_registration = None
         try:
-            registry.register_toolset_alias(name, toolset_name)
+            alias_registration = registry.register_toolset_alias(name, toolset_name)
         finally:
-            journal.capture_alias_owned_after(name)
+            journal.capture_alias_owned_after(name, alias_registration)
         journal.record_map("configs", _lazy_server_configs, name)
         journal.record_map("fingerprints", _lazy_server_fingerprints, name)
         journal.record_map("tool_names", _lazy_server_tool_names, name)

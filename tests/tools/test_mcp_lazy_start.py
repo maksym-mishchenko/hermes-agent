@@ -7,6 +7,7 @@ existing connect path.
 """
 
 import json
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -485,3 +486,87 @@ class TestResolveServerLazy:
 
     def test_explicit_false(self):
         assert mcp._resolve_server_lazy("s", {"command": "npx", "lazy": False}) is False
+
+
+def _cas_cache_entry(tool_name):
+    return {"fingerprint": "fp", "tools": [{"name": tool_name, "description": "", "inputSchema": {}}], "utility_tools": []}
+
+
+def test_public_cache_rollback_preserves_concurrent_registry_replacement(monkeypatch):
+    from tools.registry import registry
+
+    server, tool_name = "cas-registry-race", "cas_registry_race_tool"
+    original_register = registry.register
+    replaced = threading.Event()
+
+    def register_and_replace(*args, **kwargs):
+        written = original_register(*args, **kwargs)
+        if kwargs.get("name") == "mcp__cas_registry_race__cas_registry_race_tool":
+            def replace():
+                original_register(name=kwargs["name"], toolset="foreign", schema={}, handler=lambda _: "foreign", override=True)
+                replaced.set()
+            worker = threading.Thread(target=replace)
+            worker.start()
+            worker.join(2)
+            assert replaced.is_set()
+        return written
+
+    monkeypatch.setattr(registry, "register", register_and_replace)
+    monkeypatch.setattr(mcp, "_MCP_AVAILABLE", True)
+    monkeypatch.setattr("tools.mcp_schema_cache.config_fingerprint", lambda _cfg: "fp")
+    monkeypatch.setattr("tools.mcp_schema_cache.get_cached_entry", lambda _n, _fp: _cas_cache_entry(tool_name))
+    original_cached = mcp._register_from_cache_sync
+
+    def register_then_fail(name, config, entry, *, fingerprint=None, journal=None):
+        result = original_cached(name, config, entry, fingerprint=fingerprint, journal=journal)
+        assert replaced.wait(2)
+        raise RuntimeError("registry rollback barrier")
+
+    monkeypatch.setattr(mcp, "_register_from_cache_sync", register_then_fail)
+    try:
+        with pytest.raises(RuntimeError, match="registry rollback barrier"):
+            mcp.register_mcp_servers({server: {"command": "unused", "lazy": True}})
+        assert registry.get_toolset_for_tool("mcp__cas_registry_race__cas_registry_race_tool") == "foreign"
+    finally:
+        registry_name = "mcp__cas_registry_race__cas_registry_race_tool"
+        if registry.snapshot_registration(registry_name) is not None:
+            registry.deregister(registry_name)
+
+
+def test_public_cache_rollback_preserves_concurrent_alias_replacement(monkeypatch):
+    from tools.registry import registry
+
+    server, tool_name = "cas-alias-race", "cas_alias_race_tool"
+    original_alias = registry.register_toolset_alias
+    replaced = threading.Event()
+
+    def alias_and_replace(alias, toolset):
+        token = original_alias(alias, toolset)
+        if alias == server:
+            def replace():
+                original_alias(alias, "foreign-alias")
+                replaced.set()
+            worker = threading.Thread(target=replace)
+            worker.start()
+            worker.join(2)
+            assert replaced.is_set()
+        return token
+
+    monkeypatch.setattr(registry, "register_toolset_alias", alias_and_replace)
+    monkeypatch.setattr(mcp, "_MCP_AVAILABLE", True)
+    monkeypatch.setattr("tools.mcp_schema_cache.config_fingerprint", lambda _cfg: "fp")
+    monkeypatch.setattr("tools.mcp_schema_cache.get_cached_entry", lambda _n, _fp: _cas_cache_entry(tool_name))
+    original_cached = mcp._register_from_cache_sync
+
+    def register_then_fail(name, config, entry, *, fingerprint=None, journal=None):
+        result = original_cached(name, config, entry, fingerprint=fingerprint, journal=journal)
+        assert replaced.wait(2)
+        raise RuntimeError("alias rollback barrier")
+
+    monkeypatch.setattr(mcp, "_register_from_cache_sync", register_then_fail)
+    try:
+        with pytest.raises(RuntimeError, match="alias rollback barrier"):
+            mcp.register_mcp_servers({server: {"command": "unused", "lazy": True}})
+        assert registry.get_toolset_alias_target(server) == "foreign-alias"
+    finally:
+        registry.restore_toolset_alias(server, "foreign-alias", None)

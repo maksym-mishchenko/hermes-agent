@@ -242,6 +242,17 @@ class _PluginOverridePolicy:
         self.allowed = bool(allowed)
 
 
+class _AliasRegistration:
+    """Identity-bearing result for one alias write."""
+
+    __slots__ = ("alias", "value", "generation")
+
+    def __init__(self, alias: str, value: str, generation: int) -> None:
+        self.alias = alias
+        self.value = value
+        self.generation = generation
+
+
 # ---------------------------------------------------------------------------
 # check_fn TTL cache
 #
@@ -450,6 +461,7 @@ class ToolRegistry:
         self._plugin_module_scopes: Dict[str, Set[Optional[str]]] = {}
         self._toolset_checks: Dict[str, Callable] = {}
         self._toolset_aliases: Dict[str, str] = {}
+        self._toolset_alias_generations: Dict[str, int] = {}
         # MCP dynamic refresh can mutate the registry while other threads are
         # reading tool metadata, so keep mutations serialized and readers on
         # stable snapshots.
@@ -550,8 +562,8 @@ class ToolRegistry:
             if entry.toolset == toolset
         )
 
-    def register_toolset_alias(self, alias: str, toolset: str) -> None:
-        """Register an explicit alias for a canonical toolset name."""
+    def register_toolset_alias(self, alias: str, toolset: str) -> _AliasRegistration:
+        """Register an explicit alias and return its ownership token."""
         with self._lock:
             existing = self._toolset_aliases.get(alias)
             if existing and existing != toolset:
@@ -561,6 +573,9 @@ class ToolRegistry:
                 )
             self._toolset_aliases[alias] = toolset
             self._generation += 1
+            alias_generation = self._toolset_alias_generations.get(alias, 0) + 1
+            self._toolset_alias_generations[alias] = alias_generation
+            return _AliasRegistration(alias, toolset, alias_generation)
 
     def get_registered_toolset_aliases(self) -> Dict[str, str]:
         """Return a snapshot of ``{alias: canonical_toolset}`` mappings."""
@@ -575,12 +590,24 @@ class ToolRegistry:
     def restore_toolset_alias(
         self,
         alias: str,
-        current: Optional[str],
+        current: _AliasRegistration | str | None,
         previous: Optional[str],
     ) -> bool:
         """CAS-restore an alias after an aborted registration transaction."""
         with self._lock:
-            if self._toolset_aliases.get(alias) != current:
+            current_value = (
+                current.value if isinstance(current, _AliasRegistration) else current
+            )
+            current_generation = (
+                current.generation if isinstance(current, _AliasRegistration) else None
+            )
+            if (
+                self._toolset_aliases.get(alias) != current_value
+                or (
+                    current_generation is not None
+                    and self._toolset_alias_generations.get(alias) != current_generation
+                )
+            ):
                 return False
             if previous is None:
                 self._toolset_aliases.pop(alias, None)
@@ -773,8 +800,8 @@ class ToolRegistry:
         dynamic_schema_overrides: Callable = None,
         override: bool = False,
         scope: Optional[str] = None,
-    ):
-        """Register a tool.  Called at module-import time by each tool file.
+    ) -> ToolEntry | None:
+        """Register a tool and return the exact entry written.
 
         ``override=True`` is an explicit opt-in for plugins that intend to
         replace an existing built-in tool implementation (e.g. swap the
@@ -812,7 +839,7 @@ class ToolRegistry:
                         owner,
                         name,
                     )
-                    return
+                    return None
                 if not self._plugin_override_allowed(scope, owner):
                     raise PermissionError(
                         f"Plugin module {owner!r} cannot override built-in "
@@ -855,7 +882,7 @@ class ToolRegistry:
                         "intentional, or deregister the existing tool first.",
                         name, toolset, existing.toolset,
                     )
-                    return
+                    return None
             target[name] = ToolEntry(
                 name=name,
                 toolset=toolset,
@@ -878,6 +905,7 @@ class ToolRegistry:
             if scope is None and check_fn and toolset not in self._toolset_checks:
                 self._toolset_checks[toolset] = check_fn
             self._generation += 1
+            return target[name]
 
     def deregister(self, name: str) -> None:
         """Remove a tool from the registry.
