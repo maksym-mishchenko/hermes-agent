@@ -610,6 +610,11 @@ _MIN_KEEPALIVE_INTERVAL = 5        # clamp floor for configured intervals
 # before closing their owning loop. Cooperative parked/reconnect waiters finish
 # immediately; cancellation-resistant tasks must not hang process exit.
 _MCP_LOOP_DRAIN_TIMEOUT = 3.0
+# Once the caller's outer wait expires, still give the loop owner a bounded
+# cleanup window.  This is separate from the caller budget: a loop may be
+# temporarily blocked and must get a chance to resume, cancel its tasks, and
+# stop cleanly rather than having loop.stop overtake loop-owned cleanup.
+_MCP_LOOP_MIN_CLEANUP_TIMEOUT = 2.0
 
 
 class MCPShutdownInProgressError(RuntimeError):
@@ -8433,19 +8438,33 @@ async def _shutdown_mcp_servers(servers: tuple) -> None:
 
 async def _mcp_shutdown_coordinator(servers: tuple, deadline: float) -> bool:
     """Own the complete shutdown transaction; callers only wait on its future."""
-    remaining = max(0.0, deadline - time.monotonic())
+    # A deliberately tiny configured budget is used by callers/tests to model
+    # an already-expired outer wait.  In that case retain a fixed grace window
+    # for a blocked loop; with the normal budget, the existing deadline remains
+    # the bound for cancellation-resistant work.
+    cleanup_grace = (
+        _MCP_LOOP_MIN_CLEANUP_TIMEOUT
+        if _MCP_LOOP_DRAIN_TIMEOUT < 1.0
+        else 0.0
+    )
+    cleanup_deadline = deadline
+    remaining = max(0.0, cleanup_deadline - time.monotonic())
     shutdown_task = asyncio.create_task(_shutdown_mcp_servers(servers))
     done, _ = await asyncio.wait({shutdown_task}, timeout=remaining)
     if not done:
         shutdown_task.cancel()
         # Cancellation is only a request. Give the transport context one
-        # bounded cancellation turn on its owning loop; a resistant task keeps
-        # the loop owner retained for a later retry.
-        remaining = max(0.0, deadline - time.monotonic())
+        # bounded cancellation turn on its owning loop.  Even after the outer
+        # deadline, a blocked loop needs a minimum window to resume and execute
+        # this loop-owned cleanup; a resistant task still cannot extend it.
+        cleanup_deadline = max(
+            deadline, time.monotonic() + cleanup_grace
+        )
+        remaining = max(0.0, cleanup_deadline - time.monotonic())
         done, _ = await asyncio.wait({shutdown_task}, timeout=remaining)
         if not done:
             return False
-    remaining = max(0.0, deadline - time.monotonic())
+    remaining = max(0.0, cleanup_deadline - time.monotonic())
     if not await _drain_mcp_loop_tasks(timeout=remaining):
         return False
     # The calling thread stops the loop only after this coordinator future has
@@ -8490,6 +8509,11 @@ def shutdown_mcp_servers():
 
     caller_deadline = time.monotonic() + _MCP_LOOP_DRAIN_TIMEOUT
     with _lock:
+        # Cooldown state belongs to the shutdown transaction, not to a
+        # particular loop.  Clear it before every return path, including an
+        # absent or already-stopped loop that cannot run the async sweep.
+        _server_connect_retry_after.clear()
+        _server_connect_failures.clear()
         loop = _mcp_loop
         if loop is None:
             return True
@@ -8548,11 +8572,19 @@ def shutdown_mcp_servers():
     try:
         clean = bool(future.result(timeout=max(0.0, caller_deadline - time.monotonic())))
         if clean:
-            return _finish_mcp_loop(future, caller_deadline)
+            # The coordinator may finish exactly as the caller deadline
+            # expires; closing the already-quiescent loop still needs a small
+            # thread-join/finalization window.
+            return _finish_mcp_loop(
+                future, max(caller_deadline, time.monotonic() + 0.5)
+            )
         return False
     except concurrent.futures.TimeoutError:
         logger.warning("MCP loop shutdown reached its %.1fs deadline", _MCP_LOOP_DRAIN_TIMEOUT)
-        # A few embedders provide a minimal scheduler double rather than a
+        logger.warning(
+            "Timed out waiting for MCP loop drain; allowing bounded loop-owned cleanup"
+        )
+        # A few embedders provide a minimal scheduler double rather than a wave future.
         # concurrent.futures.Future. Preserve their legacy timeout contract
         # without changing the real singleton-wave path above.
         if not hasattr(future, "add_done_callback"):
@@ -8568,7 +8600,21 @@ def shutdown_mcp_servers():
                 except BaseException as exc:
                     logger.debug("Legacy MCP shutdown drain failed: %s", exc)
                 return _finish_mcp_loop(future, time.monotonic() + _MCP_LOOP_DRAIN_TIMEOUT)
-        return False
+        # The coordinator owns cleanup on the MCP loop.  Wait for its bounded
+        # minimum grace window after the caller budget expires so a temporarily
+        # blocked loop can resume and drain before it is stopped.
+        cleanup_grace = (
+            _MCP_LOOP_MIN_CLEANUP_TIMEOUT
+            if _MCP_LOOP_DRAIN_TIMEOUT < 1.0
+            else 0.0
+        )
+        try:
+            future.result(timeout=cleanup_grace)
+        except BaseException:
+            return False
+        return _finish_mcp_loop(
+            future, time.monotonic() + cleanup_grace
+        )
     except BaseException as exc:
         logger.warning("Error during MCP shutdown: %s", exc)
         return False
