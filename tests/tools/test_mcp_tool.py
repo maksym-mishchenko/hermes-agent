@@ -514,6 +514,70 @@ class TestRunOnMcpLoop:
         ]
         assert runtime_warnings == []
 
+    @staticmethod
+    def _scoped_rejection_case(monkeypatch, *, mutate_generation=False):
+        import gc
+        import warnings
+
+        import tools.mcp_tool as mcp
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        from tools.mcp_dashboard_oauth import DashboardOAuthFlow, dashboard_oauth_flow
+
+        fake_loop = MagicMock()
+        fake_loop.is_running.return_value = True
+        monkeypatch.setattr(mcp, "_mcp_loop", fake_loop)
+        monkeypatch.setattr(mcp, "_mcp_loop_shutting_down", False)
+        monkeypatch.setattr(mcp, "_mcp_generation", 11)
+        inner = {}
+        outer = {}
+        ran = {"value": False}
+
+        async def payload():
+            ran["value"] = True
+            return "ok"
+
+        def factory():
+            if mutate_generation:
+                mcp._mcp_generation += 1
+            inner["coro"] = payload()
+            return inner["coro"]
+
+        def scheduler(coro, loop, **_kwargs):
+            outer["coro"] = coro
+            return None
+
+        real_oauth_wrap = mcp._wrap_with_dashboard_oauth_flow
+
+        def capture_oauth_wrapper(coro, **kwargs):
+            wrapped = real_oauth_wrap(coro, **kwargs)
+            if wrapped is not coro:
+                outer["coro"] = wrapped
+            return wrapped
+
+        monkeypatch.setattr(mcp, "_wrap_with_dashboard_oauth_flow", capture_oauth_wrapper)
+        flow = DashboardOAuthFlow("flow", "server", "profile", "/tmp/home", "http://callback")
+        token = set_hermes_home_override("/tmp/home")
+        try:
+            with dashboard_oauth_flow(flow), warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                with patch("agent.async_utils.safe_schedule_threadsafe", side_effect=scheduler):
+                    with pytest.raises((RuntimeError, mcp.MCPShutdownInProgressError)):
+                        mcp._run_on_mcp_loop(factory)
+                gc.collect()
+        finally:
+            reset_hermes_home_override(token)
+
+        assert ran["value"] is False
+        assert inner["coro"].cr_frame is None
+        assert outer["coro"].cr_frame is None
+        assert [w for w in caught if issubclass(w.category, RuntimeWarning) and "was never awaited" in str(w.message)] == []
+
+    def test_scoped_scheduler_failure_closes_inner_and_outer_without_warning(self, monkeypatch):
+        self._scoped_rejection_case(monkeypatch)
+
+    def test_scoped_teardown_generation_race_closes_inner_and_outer_without_warning(self, monkeypatch):
+        self._scoped_rejection_case(monkeypatch, mutate_generation=True)
+
     def test_dead_loop_closes_passed_coroutine(self):
         """If loop is None, a passed coroutine (not factory) is closed."""
         import gc

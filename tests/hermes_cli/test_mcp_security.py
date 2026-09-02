@@ -92,7 +92,7 @@ def test_explicit_registration_skips_dangerous_entry_before_connect(monkeypatch)
         connected.append(name)
         return []
 
-    def _run_on_loop(coro_or_factory, timeout=30):
+    def _run_on_loop(coro_or_factory, timeout=30, **kwargs):
         import asyncio
         import inspect
         coro = coro_or_factory() if callable(coro_or_factory) else coro_or_factory
