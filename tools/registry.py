@@ -631,6 +631,9 @@ class ToolRegistry:
             else:
                 self._toolset_aliases[alias] = previous
             self._generation += 1
+            self._toolset_alias_generations[alias] = (
+                self._toolset_alias_generations.get(alias, 0) + 1
+            )
             return True
 
     # ------------------------------------------------------------------

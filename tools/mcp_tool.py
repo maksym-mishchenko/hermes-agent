@@ -5348,6 +5348,64 @@ def _discard_stale_mcp_loop_locked() -> bool:
     return True
 
 
+def _reclaim_stopped_mcp_loop(loop, thread, future, deadline: float) -> bool:
+    """Drain and finalize the exact retained owner after its thread stopped.
+
+    A failed coordinator can leave a stopped loop with cancellation-resistant
+    tasks still attached to it. Such a loop cannot be replaced, but it is still
+    safe for a public shutdown retry to drive because its owner thread is dead.
+    Never do this for a running loop or a thread that came back to life, and
+    re-check identity before finalization so a concurrent owner can never be
+    closed here.
+    """
+    with _lock:
+        if (
+            _mcp_loop is not loop
+            or _mcp_thread is not thread
+            or loop is None
+            or loop.is_running()
+            or (thread is not None and thread.is_alive())
+            or _mcp_shutdown_future is not future
+            or future is None
+            or not future.done()
+        ):
+            return False
+    try:
+        pending = [task for task in asyncio.all_tasks(loop) if not task.done()]
+    except RuntimeError:
+        pending = []
+    for task in pending:
+        while task.cancelling():
+            task.uncancel()
+        task.cancel()
+    if pending:
+        remaining = max(0.0, deadline - time.monotonic())
+        try:
+            # ``loop.stop()`` leaves the private stopping latch set even though
+            # the owner thread is dead. Clear it only while this caller drives
+            # the retained loop, then restore the stopped state.
+            was_stopping = getattr(loop, "_stopping", False)
+            loop._stopping = False
+            try:
+                done, still_pending = loop.run_until_complete(
+                    asyncio.wait(pending, timeout=remaining)
+                )
+            finally:
+                loop._stopping = was_stopping
+        except RuntimeError:
+            return False
+        if still_pending:
+            return False
+        for task in done:
+            if not task.cancelled():
+                try:
+                    task.exception()
+                except (asyncio.CancelledError, Exception):
+                    pass
+    result = _finish_mcp_loop(future, deadline)
+    return result
+
+
 def _wrap_with_home_override(coro: "Coroutine", *, on_start=None) -> "Coroutine":
     """Carry the caller's context-local HERMES_HOME override into ``coro``.
 
@@ -8518,56 +8576,84 @@ def shutdown_mcp_servers():
         if loop is None:
             return True
         if not loop.is_running():
-            # A stopped/closed owner cannot accept a shutdown submission. Only
-            # clear it when its thread and asyncio task set are provably gone;
-            # otherwise preserve ownership and let a later call retry safely.
-            if _discard_stale_mcp_loop_locked():
+            # A stopped owner may have a terminal failed coordinator and
+            # cancellation-resistant tasks left on it. Keep ownership exact,
+            # then let the retry drive that dead loop long enough to drain it;
+            # never replace or close it while its thread is live.
+            stale_thread = _mcp_thread
+            stale_future = _mcp_shutdown_future
+            if (
+                stale_future is not None
+                and stale_future.done()
+                and stale_thread is not None
+                and not stale_thread.is_alive()
+            ):
+                pass
+            elif _discard_stale_mcp_loop_locked():
                 return True
-            return False
-        future = _mcp_shutdown_future
-        # Join an existing wave, including a coordinator that already completed
-        # false.  It is not replaceable until every caller in this wave returns.
-        if not _mcp_shutdown_wave_active:
-            _mcp_shutdown_servers = tuple(_servers.values())
-            _mcp_shutdown_deadline = caller_deadline
-            _mcp_loop_shutting_down = True
-            _mcp_generation += 1
-            _mcp_finalization_future = concurrent.futures.Future()
-            coordinator_coro = _mcp_shutdown_coordinator(
-                _mcp_shutdown_servers, caller_deadline
-            )
-            try:
-                future = safe_schedule_threadsafe(
-                    coordinator_coro,
-                    loop,
-                    logger=logger,
-                    log_message="MCP shutdown: failed to schedule",
-                )
-            except BaseException:
-                coordinator_coro.close()
-                future = None
-            if future is None:
-                coordinator_coro.close()
-                # No coordinator was admitted, so undo the claim immediately.
-                _mcp_loop_shutting_down = False
-                _mcp_shutdown_servers = ()
-                _mcp_shutdown_deadline = None
-                finalization = _mcp_finalization_future
-                _mcp_finalization_future = None
-                if finalization is not None and not finalization.done():
-                    finalization.set_result(False)
+            else:
                 return False
-            _mcp_shutdown_future = future
-            _mcp_shutdown_wave_active = True
-        _mcp_shutdown_waiters += 1
-        future = _mcp_shutdown_future
-        assert future is not None
-        if hasattr(future, "add_done_callback"):
-            future.add_done_callback(_shutdown_wave_done)
         else:
-            # Keep simple test doubles compatible with the real Future contract;
-            # production schedulers always provide add_done_callback.
-            logger.debug("MCP shutdown scheduler returned a legacy future")
+            stale_thread = None
+            stale_future = None
+        if not loop.is_running():
+            # Do not hold the global lock while running the retained loop.
+            pass
+        else:
+            stale_thread = None
+            stale_future = None
+            future = _mcp_shutdown_future
+            # Join an existing wave, including a coordinator that already completed
+            # false.  It is not replaceable until every caller in this wave returns.
+            if not _mcp_shutdown_wave_active:
+                _mcp_shutdown_servers = tuple(_servers.values())
+                _mcp_shutdown_deadline = caller_deadline
+                _mcp_loop_shutting_down = True
+                _mcp_generation += 1
+                _mcp_finalization_future = concurrent.futures.Future()
+                coordinator_coro = _mcp_shutdown_coordinator(
+                    _mcp_shutdown_servers, caller_deadline
+                )
+                try:
+                    future = safe_schedule_threadsafe(
+                        coordinator_coro,
+                        loop,
+                        logger=logger,
+                        log_message="MCP shutdown: failed to schedule",
+                    )
+                except BaseException:
+                    coordinator_coro.close()
+                    future = None
+                if future is None:
+                    coordinator_coro.close()
+                    # No coordinator was admitted, so undo the claim immediately.
+                    _mcp_loop_shutting_down = False
+                    _mcp_shutdown_servers = ()
+                    _mcp_shutdown_deadline = None
+                    finalization = _mcp_finalization_future
+                    _mcp_finalization_future = None
+                    if finalization is not None and not finalization.done():
+                        finalization.set_result(False)
+                    return False
+                _mcp_shutdown_future = future
+                _mcp_shutdown_wave_active = True
+            _mcp_shutdown_waiters += 1
+            future = _mcp_shutdown_future
+            assert future is not None
+            if hasattr(future, "add_done_callback"):
+                future.add_done_callback(_shutdown_wave_done)
+            else:
+                # Keep simple test doubles compatible with the real Future contract;
+                # production schedulers always provide add_done_callback.
+                logger.debug("MCP shutdown scheduler returned a legacy future")
+
+    if stale_future is not None:
+        return _reclaim_stopped_mcp_loop(
+            loop,
+            stale_thread,
+            stale_future,
+            time.monotonic() + _MCP_LOOP_DRAIN_TIMEOUT,
+        )
 
     try:
         clean = bool(future.result(timeout=max(0.0, caller_deadline - time.monotonic())))
@@ -8609,8 +8695,12 @@ def shutdown_mcp_servers():
             else 0.0
         )
         try:
-            future.result(timeout=cleanup_grace)
+            clean = bool(future.result(timeout=cleanup_grace))
         except BaseException:
+            return False
+        if not clean:
+            # A failed coordinator leaves the loop running and owned.  Only a
+            # successful coordinator is allowed to request loop finalization.
             return False
         return _finish_mcp_loop(
             future, time.monotonic() + cleanup_grace
@@ -8766,10 +8856,16 @@ async def _drain_mcp_loop_tasks(
 ) -> bool:
     """Cancel and reap pending tasks while their owning loop is open."""
     current = asyncio.current_task()
-    pending = [t for t in asyncio.all_tasks() if t is not current and not t.done()]
+    pending = []
+    for task in asyncio.all_tasks():
+        if task is current or task.done():
+            continue
+        pending.append(task)
     if not pending:
         return True
     for task in pending:
+        while task.cancelling():
+            task.uncancel()
         task.cancel()
     done, still_pending = await asyncio.wait(pending, timeout=timeout)
     for task in done:

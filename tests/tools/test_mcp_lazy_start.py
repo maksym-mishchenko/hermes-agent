@@ -616,6 +616,32 @@ def test_public_cache_rollback_preserves_same_string_alias_aba(monkeypatch):
         registry.restore_toolset_alias(server, f"mcp-{server}", None)
 
 
+def test_restore_toolset_alias_bumps_generation_and_rejects_aba_10x():
+    """Every accepted restore invalidates older same-value ownership tokens."""
+    from tools.registry import registry
+
+    alias = "restore-alias-generation-aba"
+    first = registry.register_toolset_alias(alias, "toolset")
+    try:
+        assert registry.restore_toolset_alias(alias, first, "previous") is True
+        restored = registry.snapshot_toolset_alias(alias)
+        assert restored is not None
+        assert restored.generation > first.generation
+        assert restored.value == "previous"
+
+        current = registry.register_toolset_alias(alias, "same-value")
+        for _ in range(10):
+            replacement = registry.register_toolset_alias(alias, "same-value")
+            assert replacement.generation > current.generation
+            assert registry.restore_toolset_alias(alias, current, "same-value") is False
+            current = replacement
+        assert registry.get_toolset_alias_target(alias) == "same-value"
+    finally:
+        latest = registry.snapshot_toolset_alias(alias)
+        if latest is not None:
+            assert registry.restore_toolset_alias(alias, latest, None) is True
+
+
 def test_public_cache_rollback_preserves_concurrent_utility_replacement_10x(
     monkeypatch,
 ):

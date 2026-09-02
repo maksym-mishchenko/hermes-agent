@@ -728,7 +728,8 @@ def test_factory_runs_outside_admission_lock_and_payload_is_rejected(monkeypatch
     assert not payload_ran.is_set()
 
 
-def test_shutdown_wave_of_fifty_resistant_callers_retries_once(monkeypatch):
+@pytest.mark.parametrize("attempt", range(3))
+def test_shutdown_wave_of_fifty_resistant_callers_retries_once(monkeypatch, attempt):
     """One failed wave is shared by all callers; only quiescence permits retry."""
     from tools import mcp_tool
 
@@ -783,6 +784,38 @@ def test_shutdown_wave_of_fifty_resistant_callers_retries_once(monkeypatch):
     assert coordinator_calls == 2
     with mcp_tool._lock:
         assert mcp_tool._mcp_loop is None
+
+
+def test_short_bound_resistant_retry_closes_exact_owner_resources(monkeypatch):
+    """A bounded retry drains a released task and closes its self-pipe exactly."""
+    from tools import mcp_tool
+
+    _reset_mcp_state(mcp_tool)
+    monkeypatch.setattr(mcp_tool, "_MCP_LOOP_DRAIN_TIMEOUT", 0.1)
+    released = threading.Event()
+    baseline_fds = set(os.listdir("/proc/self/fd"))
+    mcp_tool._ensure_mcp_loop()
+    loop = mcp_tool._mcp_loop
+    thread = mcp_tool._mcp_thread
+
+    async def resistant():
+        while not released.is_set():
+            try:
+                await asyncio.sleep(0.01)
+            except asyncio.CancelledError:
+                continue
+
+    asyncio.run_coroutine_threadsafe(resistant(), loop)
+    assert mcp_tool.shutdown_mcp_servers() is False
+    released.set()
+    assert mcp_tool.shutdown_mcp_servers() is True
+    assert thread is not None and not thread.is_alive()
+    assert loop.is_closed()
+    with mcp_tool._lock:
+        assert mcp_tool._mcp_loop is None
+        assert mcp_tool._mcp_thread is None
+        assert not mcp_tool._mcp_loop_shutting_down
+    assert set(os.listdir("/proc/self/fd")) == baseline_fds
 
 
 def test_pending_shutdown_wave_reuses_coordinator_before_retry(monkeypatch):
