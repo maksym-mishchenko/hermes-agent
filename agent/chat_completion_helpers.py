@@ -2798,8 +2798,15 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             agent.client = None
             agent._client_kwargs = {}
         else:
-            # Swap OpenAI client and config in-place
-            agent.api_key = fb_client.api_key
+            # Swap OpenAI client and config in-place. The OpenAI SDK
+            # materializes callable token providers (for example Azure Entra
+            # ID) into a token string on ``client.api_key``. Reusing that
+            # string changes Azure auth from bearer-token refresh to a static
+            # ``api-key`` header, so prefer the preserved original source.
+            fallback_api_key = getattr(
+                fb_client, "_hermes_api_key_source", fb_client.api_key
+            )
+            agent.api_key = fallback_api_key
             agent.client = fb_client
             # Preserve provider-specific headers that
             # resolve_provider_client() may have baked into
@@ -2813,7 +2820,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             if not fb_headers:
                 fb_headers = getattr(fb_client, "default_headers", None)
             agent._client_kwargs = {
-                "api_key": fb_client.api_key,
+                "api_key": fallback_api_key,
                 "base_url": fb_base_url,
                 **({"default_headers": dict(fb_headers)} if fb_headers else {}),
             }

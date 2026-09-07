@@ -259,6 +259,29 @@ class TestRestorePrimaryRuntime:
 
         assert agent._fallback_index == 0  # reset for next turn
 
+    def test_azure_fallback_preserves_entra_token_provider(self):
+        """Fallback rebuild must not convert an Entra bearer into api-key auth."""
+        token_provider = lambda: "short-lived-bearer"  # noqa: E731
+        agent = _make_agent(
+            fallback_model={"provider": "azure-foundry", "model": "gpt-5.6-sol"},
+            provider="azure-foundry",
+            base_url="https://example.openai.azure.com/openai/v1/",
+        )
+        mock_client = _mock_resolve(
+            base_url="https://example.openai.azure.com/openai/v1/",
+            api_key="materialized-token",
+        )
+        mock_client._hermes_api_key_source = token_provider
+
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(mock_client, "gpt-5.6-sol"),
+        ):
+            assert agent._try_activate_fallback() is True
+
+        assert agent.api_key is token_provider
+        assert getattr(agent, "_client_kwargs")["api_key"] is token_provider
+
     def test_restores_compressor_state(self):
         agent = _make_agent(
             fallback_model={"provider": "openrouter", "model": "anthropic/claude-sonnet-4"},

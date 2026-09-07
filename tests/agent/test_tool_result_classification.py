@@ -16,6 +16,16 @@ def test_write_file_with_nested_lint_error_counts_as_landed():
     assert file_mutation_result_landed("write_file", result) is True
 
 
+def test_patch_with_lsp_diagnostics_counts_as_landed():
+    result = json.dumps({
+        "success": True,
+        "files_modified": ["src/example.tsx"],
+        "lsp_diagnostics": "ERROR: unrelated project diagnostics",
+    })
+
+    assert file_mutation_result_landed("patch", result) is True
+
+
 
 
 

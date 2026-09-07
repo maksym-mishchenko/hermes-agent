@@ -156,6 +156,48 @@ _UTC_NOW = lambda: datetime.now(timezone.utc)
 # Official docs snapshot entries. Models whose published pricing and cache
 # semantics are stable enough to encode exactly.
 _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
+    # Azure AI Foundry Global Standard, short-context pricing.  Azure applies
+    # the 2026-07-30 Terra/Luna discounts, which differ from the original
+    # OpenAI launch snapshot below.  Long-context requests use a different
+    # rate card; Hermes deployments using these entries must keep their
+    # configured context below Azure's long-context threshold.
+    # Source: https://azure.microsoft.com/en-us/blog/gpt-5-6-now-available-in-microsoft-foundry
+    (
+        "azure-foundry",
+        "gpt-5.6-sol",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("5.00"),
+        output_cost_per_million=Decimal("30.00"),
+        cache_read_cost_per_million=Decimal("0.50"),
+        cache_write_cost_per_million=Decimal("6.25"),
+        source="official_docs_snapshot",
+        source_url="https://azure.microsoft.com/en-us/blog/gpt-5-6-now-available-in-microsoft-foundry",
+        pricing_version="azure-foundry-gpt-5.6-global-standard-2026-07-30",
+    ),
+    (
+        "azure-foundry",
+        "gpt-5.6-terra",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("2.00"),
+        output_cost_per_million=Decimal("12.00"),
+        cache_read_cost_per_million=Decimal("0.20"),
+        cache_write_cost_per_million=Decimal("2.50"),
+        source="official_docs_snapshot",
+        source_url="https://azure.microsoft.com/en-us/blog/gpt-5-6-now-available-in-microsoft-foundry",
+        pricing_version="azure-foundry-gpt-5.6-global-standard-2026-07-30",
+    ),
+    (
+        "azure-foundry",
+        "gpt-5.6-luna",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("0.20"),
+        output_cost_per_million=Decimal("1.20"),
+        cache_read_cost_per_million=Decimal("0.02"),
+        cache_write_cost_per_million=Decimal("0.25"),
+        source="official_docs_snapshot",
+        source_url="https://azure.microsoft.com/en-us/blog/gpt-5-6-now-available-in-microsoft-foundry",
+        pricing_version="azure-foundry-gpt-5.6-global-standard-2026-07-30",
+    ),
     # ── OpenAI GPT-5.6 series (Sol/Terra/Luna) ───────────────────────────
     # Announced in limited preview 2026-06-26; GA 2026-07-09 at the same
     # rates (Sol $5/$30, Terra $2.50/$15, Luna $1/$6 per 1M in/out). Cache
@@ -1103,6 +1145,8 @@ def resolve_billing_route(
     # openai-api provider path.
     if provider_name in {"openai", "openai-api"}:
         return BillingRoute(provider="openai", model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
+    if provider_name == "azure-foundry":
+        return BillingRoute(provider="azure-foundry", model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
     if provider_name in {"minimax", "minimax-cn"}:
         return BillingRoute(provider=provider_name, model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
     # Google AI Studio (Gemini) and Vertex AI host the same Gemini models.

@@ -84,6 +84,40 @@ def test_normalize_usage_openai_reads_top_level_anthropic_cache_fields():
 
 
 
+def test_azure_foundry_gpt56_uses_current_global_standard_pricing():
+    result = estimate_usage_cost(
+        "gpt-5.6-luna",
+        CanonicalUsage(
+            input_tokens=1_000_000,
+            cache_read_tokens=1_000_000,
+            output_tokens=1_000_000,
+        ),
+        provider="azure-foundry",
+    )
+
+    assert result.status == "estimated"
+    assert result.source == "official_docs_snapshot"
+    assert result.amount_usd is not None
+    assert float(result.amount_usd) == 1.42
+    assert result.pricing_version == "azure-foundry-gpt-5.6-global-standard-2026-07-30"
+
+
+def test_azure_foundry_sol_prices_real_short_context_usage():
+    result = estimate_usage_cost(
+        "gpt-5.6-sol",
+        CanonicalUsage(
+            input_tokens=90_584,
+            cache_read_tokens=69_414,
+            output_tokens=308,
+        ),
+        provider="azure-foundry",
+    )
+
+    assert result.status == "estimated"
+    assert result.amount_usd is not None
+    assert float(result.amount_usd) == 0.496867
+
+
 def test_deepseek_v4_pro_pricing_entry_exists():
     """Regression test: deepseek-v4-pro must have a pricing entry.
 

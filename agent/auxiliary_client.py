@@ -2131,6 +2131,12 @@ class CodexAuxiliaryClient:
         self.chat = _CodexChatShim(adapter)
         self.api_key = real_client.api_key
         self.base_url = real_client.base_url
+        # OpenAI materializes callable API-key providers during construction.
+        # Preserve Hermes's original source separately so callers rebuilding a
+        # client (notably provider fallback) do not turn an Entra bearer token
+        # into a static Azure ``api-key`` credential.
+        if hasattr(real_client, "_hermes_api_key_source"):
+            self._hermes_api_key_source = real_client._hermes_api_key_source
 
     def close(self):
         self._real_client.close()
@@ -2165,6 +2171,8 @@ class AsyncCodexAuxiliaryClient:
         self.chat = _AsyncCodexChatShim(async_adapter)
         self.api_key = sync_wrapper.api_key
         self.base_url = sync_wrapper.base_url
+        if hasattr(sync_wrapper, "_hermes_api_key_source"):
+            self._hermes_api_key_source = sync_wrapper._hermes_api_key_source
         # Mirror the sync wrapper's _real_client so cache eviction by leaf
         # OpenAI client (e.g. _close_client_on_timeout in #23482) drops
         # this async entry too. Without this, sync and async cache entries
@@ -4095,6 +4103,10 @@ def _try_azure_foundry(
         extra["default_query"] = _dq
 
     client = _create_openai_client(api_key=api_key, base_url=_clean_base, **extra)
+    # The OpenAI SDK resolves callable API-key providers into a token string
+    # on the client object. Keep the callable so a later fallback rebuild can
+    # continue using Authorization: Bearer rather than Azure's api-key header.
+    client._hermes_api_key_source = api_key
 
     if runtime_api_mode == "codex_responses":
         # GPT-5.x / o-series / codex models on Azure Foundry are
