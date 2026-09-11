@@ -39,6 +39,48 @@ def _assistant_row_missing_visible_text(msg: dict) -> bool:
     return not flatten_message_text(msg.get("content")).strip()
 
 
+def _record_kanban_guardrail_halt(decision, logger: logging.Logger) -> bool:
+    """Fail a native worker's own run; a closed or superseded run is untouched."""
+    from agent.delegation_context import (
+        is_delegated_child_process_context,
+        is_dispatcher_owned_worker_context,
+    )
+
+    task_id = os.environ.get("HERMES_KANBAN_TASK")
+    raw_run_id = os.environ.get("HERMES_KANBAN_RUN_ID")
+    if (not task_id or not raw_run_id or not is_dispatcher_owned_worker_context()
+            or is_delegated_child_process_context()):
+        return False
+    try:
+        run_id = int(raw_run_id)
+        if run_id <= 0:
+            raise ValueError("non-positive run id")
+    except ValueError:
+        logger.warning("Invalid Kanban run identity for hardguard finalization")
+        return False
+
+    try:
+        from hermes_cli.kanban_db import block_task
+        from hermes_cli.kanban_db_connect import connect
+
+        conn = connect()
+        try:
+            changed = block_task(
+                conn, task_id, kind="capability", expected_run_id=run_id,
+                reason=(f"Hard tool guardrail stopped this worker without a verdict: "
+                        f"tool={decision.tool_name} guard={decision.code} count={decision.count}"),
+            )
+            if not changed:
+                logger.info("Guardrail finalization left closed or superseded Kanban run %s untouched",
+                            run_id)
+        finally:
+            conn.close()
+    except Exception:
+        logger.warning("Could not persist Kanban hardguard failure for run %s",
+                       run_id, exc_info=True)
+    return True
+
+
 def _record_kanban_budget_exhausted(
     kanban_task: str, api_call_count: int, max_iterations: int, logger: logging.Logger
 ) -> None:
@@ -167,7 +209,7 @@ def _resolve_budget_fallback(
     # terminal outcome so the task does not remain in an ambiguous lifecycle state. The worker's run is
     # closed via ``_record_task_failure`` (compare-and-swap receipt path) which is a no-op if another path
     # closed it — the CAS invariant in ``_end_run`` (``WHERE ended_at IS NULL``) guarantees idempotence.
-    if _kanban_task:
+    if _kanban_task and _turn_exit_reason != "guardrail_halt":
         _record_kanban_budget_exhausted(_kanban_task, api_call_count, agent.max_iterations, logger)
     return final_response, _turn_exit_reason, preserved_verification_fallback
 
@@ -440,6 +482,10 @@ def finalize_turn(
 ):
     """Run the post-loop finalization and return the turn ``result`` dict."""
     from agent.conversation_loop import logger
+
+    if _turn_exit_reason == "guardrail_halt":
+        if _record_kanban_guardrail_halt(agent._tool_guardrail_halt_decision, logger):
+            failed = True
 
     final_response, _turn_exit_reason, preserved_verification_fallback = _resolve_budget_fallback(
         agent, final_response=final_response, api_call_count=api_call_count,
