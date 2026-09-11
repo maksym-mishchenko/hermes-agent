@@ -1,11 +1,144 @@
 """Runtime tests for tool-call loop guardrails."""
 
 import json
+import logging
 import uuid
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from run_agent import AIAgent
+
+
+@pytest.fixture
+def native_review(monkeypatch, tmp_path):
+    from hermes_cli import kanban_db as kb
+    connect = kb.connect
+
+    home = tmp_path / "hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(home / "board.db"))
+    monkeypatch.setenv("HERMES_PROFILE", "reviewer")
+    for name in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID",
+                 "HERMES_DELEGATED_CHILD_CONTEXT"):
+        monkeypatch.delenv(name, raising=False)
+    with connect() as conn:
+        tid = kb.create_task(conn, title="Review existing evidence", assignee="programmer")
+        implementation = kb.claim_task(conn, tid)
+        assert kb.request_review(conn, tid, reviewer="reviewer", summary="Ready for review",
+                                 expected_run_id=implementation.current_run_id)
+        task = kb.claim_review_task(conn, tid)
+        assert task is not None
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(task.current_run_id))
+    return kb, connect, tid, task.current_run_id
+
+
+def _run_review_reads(tmp_path, *, max_iterations=10, recoverable=False):
+    from tools.file_tools import read_file_tool, reset_file_dedup
+
+    paths = [tmp_path / "review.py", tmp_path / "commands.json"]
+    for path in paths:
+        path.write_text("Existing review evidence.\n")
+    agent = _make_agent("read_file", max_iterations=max_iterations, config=_hard_stop_config())
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response("", "tool_calls", [
+            _mock_tool_call("read_file", json.dumps({"path": str(path)}))
+            for path in (paths[:1] if recoverable else paths)
+        ]) for _ in range(1 if recoverable else 6)
+    ] + ([_mock_response("The read failed.")] if recoverable else [])
+
+    def read(_name, args, task_id, **_kwargs):
+        # Native compression resets file dedup so discarded evidence can be
+        # read again; the turn-wide hardguard remains unchanged.
+        if not recoverable:
+            reset_file_dedup(task_id)
+        path = str(paths[0].with_suffix(".missing")) if recoverable else args["path"]
+        return read_file_tool(path=path, task_id=task_id)
+
+    with (
+        patch("run_agent.handle_function_call", side_effect=read) as dispatch,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("Review the existing evidence")
+    return agent, result, dispatch.call_count
+
+
+@pytest.mark.parametrize("max_iterations", [6, 10])
+def test_native_hardguard_closes_review_exactly_once(native_review, tmp_path, max_iterations):
+    from agent.turn_finalizer import _record_kanban_guardrail_halt
+
+    kb, connect, tid, run_id = native_review
+    agent, result, calls = _run_review_reads(tmp_path, max_iterations=max_iterations)
+    assert calls == 10
+    assert result["turn_exit_reason"] == "guardrail_halt"
+    assert result["failed"] is True and result["completed"] is False
+    for _ in range(2):
+        _record_kanban_guardrail_halt(agent._tool_guardrail_halt_decision,
+                                    logging.getLogger(__name__))
+    with connect() as conn:
+        task = kb.get_task(conn, tid)
+        run = kb.latest_run(conn, tid)
+        assert task.status == "blocked" and task.current_run_id is None
+        assert run.id == run_id and run.outcome == "blocked"
+        assert "idempotent_no_progress_block" in run.summary
+        assert "read_file" in run.summary and "count=5" in run.summary
+        assert conn.execute(
+            "SELECT count(*) FROM task_events WHERE task_id=? AND kind='blocked'", (tid,),
+        ).fetchone()[0] == 1
+        assert task.consecutive_failures == 0
+
+
+@pytest.mark.parametrize("context", [
+    "successor", "handoff", "missing", "invalid", "foreign-run", "no-task",
+    "delegated", "child-process", "cron",
+])
+def test_hardguard_cannot_mutate_unowned_review(native_review, monkeypatch, tmp_path, context):
+    from agent.delegation_context import delegated_child_context, non_dispatcher_owned_context
+
+    kb, connect, tid, old_run = native_review
+    if context in {"successor", "handoff"}:
+        with connect() as conn:
+            ok, reason = kb.request_changes(conn, tid, reason="Existing reviewer verdict",
+                                            expected_run_id=old_run)
+            assert ok, reason
+            if context == "successor":
+                assert kb.claim_task(conn, tid, claimer="successor")
+    if context == "missing":
+        monkeypatch.delenv("HERMES_KANBAN_RUN_ID")
+    elif context == "invalid":
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "invalid")
+    elif context == "foreign-run":
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(old_run + 1000))
+    elif context == "no-task":
+        monkeypatch.delenv("HERMES_KANBAN_TASK")
+    elif context == "child-process":
+        monkeypatch.setenv("HERMES_DELEGATED_CHILD_CONTEXT", "1")
+    scope = (delegated_child_context() if context == "delegated" else
+             non_dispatcher_owned_context() if context == "cron" else nullcontext())
+    with connect() as conn:
+        before = list(conn.iterdump())
+    with scope:
+        _, result, calls = _run_review_reads(tmp_path, max_iterations=6)
+    assert calls == 10 and result["turn_exit_reason"] == "guardrail_halt"
+    with connect() as conn:
+        assert list(conn.iterdump()) == before
+
+
+def test_recoverable_read_error_does_not_finalize_review(native_review, monkeypatch, tmp_path):
+    kb, connect, tid, run_id = native_review
+    monkeypatch.setenv("HERMES_KANBAN_STOP_NUDGE", "0")
+    _, result, calls = _run_review_reads(tmp_path, recoverable=True)
+    assert calls == 1 and result["turn_exit_reason"].startswith("text_response")
+    with connect() as conn:
+        task = kb.get_task(conn, tid)
+        assert task.status == "running" and task.current_run_id == run_id
+
 
 
 def _make_tool_defs(*names: str) -> list[dict]:

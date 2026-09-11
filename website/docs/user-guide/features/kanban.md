@@ -414,6 +414,13 @@ reminds the model to call `kanban_complete` or `kanban_block` immediately. This
 guard is active only for dispatcher-spawned workers (`HERMES_KANBAN_TASK` is
 set) and can be disabled with `HERMES_KANBAN_STOP_NUDGE=0`.
 
+**Hard tool-loop stops:** A hard guardrail can end the turn before those nudges
+run. Hermes records a `capability` block for the dispatcher's current run, with
+the guard code, tool name, and repetition count. This is an unsuccessful run
+requiring investigation, not a review verdict or approval. An already closed
+or superseded run cannot block its successor. Ordinary recoverable tool errors
+do not take this path; hard-stop thresholds and read restrictions are unchanged.
+
 **Dispatcher-side recovery:** If the nudges are exhausted or the worker crashes
 before reaching the nudge, the dispatcher gives the violation a **bounded retry**
 (up to `_PROTOCOL_VIOLATION_FAILURE_LIMIT` consecutive violations, default 3)
