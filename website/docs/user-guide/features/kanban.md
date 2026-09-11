@@ -421,6 +421,20 @@ requiring investigation, not a review verdict or approval. An already closed
 or superseded run cannot block its successor. Ordinary recoverable tool errors
 do not take this path; hard-stop thresholds and read restrictions are unchanged.
 
+**Worker reorientation:** `kanban_show` defaults to the current worker's task,
+run identity, latest implementation/review receipts, subsequent comments,
+attachment references, and parent handoffs. It does not duplicate that evidence
+inside a second full history rendering. A superseded worker sees its own closed
+run separately from the current claim. Omission counts identify older history.
+Use `history="comments"`, `"runs"`, or `"events"` with `limit` (1–50, default 10)
+to retrieve a newest-first page; pass `next_before_id` back as `before_id` for
+earlier pages. These pages do not repeat the task context. Non-worker callers
+retain the original full default view.
+
+Current handoffs and directions are not truncated to meet an output quota, so
+an unusually large current specification or attachment list can still spill to
+disk. Required skill reloads after compression and guard thresholds are unchanged.
+
 **Dispatcher-side recovery:** If the nudges are exhausted or the worker crashes
 before reaching the nudge, the dispatcher gives the violation a **bounded retry**
 (up to `_PROTOCOL_VIOLATION_FAILURE_LIMIT` consecutive violations, default 3)

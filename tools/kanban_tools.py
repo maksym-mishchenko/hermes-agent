@@ -523,6 +523,17 @@ def _handle_show(args: dict, **kw) -> str:
             "task_id is required (or set HERMES_KANBAN_TASK in the env)"
         )
     board = args.get("board")
+    history = args.get("history")
+    if history not in (None, "comments", "runs", "events"):
+        return tool_error("history must be comments, runs, or events")
+    limit = args.get("limit", 10)
+    before_id = args.get("before_id")
+    if type(limit) is not int or not 1 <= limit <= 50:
+        return tool_error("limit must be an integer between 1 and 50")
+    if before_id is not None and (type(before_id) is not int or before_id <= 0):
+        return tool_error("before_id must be a positive integer")
+    if history is None and ("limit" in args or before_id is not None):
+        return tool_error("history is required when using limit or before_id")
     try:
         kb, conn = _connect(board=board)
         try:
@@ -559,6 +570,89 @@ def _handle_show(args: dict, **kw) -> str:
                     "metadata": r.metadata,
                     "started_at": r.started_at, "ended_at": r.ended_at,
                 }
+
+            def _comment_dict(c):
+                return {"id": c.id, "author": c.author, "body": c.body,
+                        "created_at": c.created_at}
+
+            def _event_dict(e):
+                return {"id": e.id, "kind": e.kind, "payload": e.payload,
+                        "created_at": e.created_at, "run_id": e.run_id}
+
+            if history is not None:
+                rows, render = {
+                    "comments": (comments, _comment_dict),
+                    "runs": (runs, _run_dict),
+                    "events": (events, _event_dict),
+                }[history]
+                eligible = sorted(
+                    (row for row in rows if before_id is None or row.id < before_id),
+                    key=lambda row: row.id, reverse=True,
+                )
+                page = eligible[:limit]
+                has_more = len(eligible) > len(page)
+                return json.dumps({
+                    "task_id": tid, "history": history,
+                    "items": [render(row) for row in page],
+                    "has_more": has_more,
+                    "next_before_id": page[-1].id if has_more else None,
+                })
+
+            from agent.delegation_context import (
+                is_delegated_child_process_context,
+                is_dispatcher_owned_worker_context,
+            )
+            worker_run_id = _worker_run_id(tid)
+            compact = (
+                worker_run_id is not None and worker_run_id > 0
+                and is_dispatcher_owned_worker_context()
+                and not is_delegated_child_process_context()
+            )
+            if compact:
+                handoffs = {}
+                for run in runs:
+                    if run.ended_at is not None and run.outcome in (
+                        "review_requested", "changes_requested",
+                    ):
+                        handoffs[run.outcome] = run
+                # Keep formal review receipts through crash/reclaim attempts.
+                # Their complete payloads and subsequent directions are current
+                # evidence, not history to truncate to meet an output budget.
+                since = min(
+                    (run.started_at for run in handoffs.values()),
+                    default=task.created_at,
+                )
+                selected_ids = {run.id for run in handoffs.values()}
+                selected_ids.update((worker_run_id, task.current_run_id))
+                selected_runs = [run for run in runs if run.id in selected_ids]
+                current_comments = [comment for comment in comments if comment.created_at >= since]
+                own_run = next((run for run in selected_runs if run.id == worker_run_id), None)
+                return json.dumps({
+                    "task": _task_dict(task), "parents": parents, "children": children,
+                    "worker_run": {
+                        "id": worker_run_id,
+                        "is_current": (
+                            own_run is not None and own_run.ended_at is None
+                            and task.status == "running" and task.current_run_id == worker_run_id
+                        ),
+                        "outcome": own_run.outcome if own_run is not None else None,
+                        "ended_at": own_run.ended_at if own_run is not None else None,
+                    },
+                    "runs": [_run_dict(run) for run in selected_runs],
+                    "comments": [_comment_dict(comment) for comment in current_comments],
+                    "events": [],
+                    "history": {
+                        "omitted": {
+                            "runs": len(runs) - len(selected_runs),
+                            "comments": len(comments) - len(current_comments),
+                            "events": len(events),
+                        },
+                        "retrieval": "Use history=comments|runs|events with limit and next_before_id as before_id.",
+                    },
+                    "worker_context": kb.build_worker_context(
+                        conn, tid, include_history=False, include_body=False,
+                    ),
+                })
 
             return json.dumps({
                 "task": _task_dict(task),
@@ -1696,12 +1790,14 @@ def _board_schema_prop() -> dict[str, str]:
 KANBAN_SHOW_SCHEMA = {
     "name": "kanban_show",
     "description": (
-        "Read a task's full state — title, body, assignee, parent task "
-        "handoffs, your prior attempts on this task if any, comments, "
-        "and recent events. Use this to (re)orient yourself before "
-        "starting work, especially on retries. The response includes a "
-        "pre-formatted ``worker_context`` string suitable for inclusion "
-        "verbatim in your reasoning."
+        "Read task state and authoritative handoff evidence. Native workers "
+        "get their run identity, latest review receipts, current directions, "
+        "attachment references and parent handoffs without duplicating history. "
+        "Omission counts identify older history; request history=comments, runs, "
+        "or events to retrieve a bounded page, newest first. Follow next_before_id "
+        "as before_id for earlier pages. Reload only evidence needed for the "
+        "current review, not every prior attempt. Other callers retain the full "
+        "default view."
     ),
     "parameters": {
         "type": "object",
@@ -1711,6 +1807,19 @@ KANBAN_SHOW_SCHEMA = {
                 "description": _DESC_TASK_ID_DEFAULT,
             },
             "board": _board_schema_prop(),
+            "history": {
+                "type": "string",
+                "enum": ["comments", "runs", "events"],
+                "description": "Retrieve one history collection instead of repeating current context.",
+            },
+            "limit": {
+                "type": "integer", "minimum": 1, "maximum": 50,
+                "description": "History page size, default 10; requires history.",
+            },
+            "before_id": {
+                "type": "integer", "minimum": 1,
+                "description": "Exclusive history cursor from next_before_id; requires history.",
+            },
         },
         "required": [],
     },

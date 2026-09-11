@@ -11012,7 +11012,10 @@ def run_daemon(
 # Worker context builder (what a spawned worker sees)
 # ---------------------------------------------------------------------------
 
-def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
+def build_worker_context(
+    conn: sqlite3.Connection, task_id: str, *,
+    include_history: bool = True, include_body: bool = True,
+) -> str:
     """Return the full text a worker should read to understand its task.
 
     Order:
@@ -11030,6 +11033,9 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
          completed runs on other tasks).
       6. Comment thread (most recent ``_CTX_MAX_COMMENTS`` shown, older
          collapsed).
+
+    Structured tool responses can supply body/history separately, without
+    duplicating them in this rendering. Spawn-time callers retain both.
 
     All caps exist so worker prompts stay bounded even on pathological
     boards (retry-heavy tasks, comment storms). The per-field char cap
@@ -11074,7 +11080,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
         lines.append(f"Branch:   {task.branch_name}")
     lines.append("")
 
-    if task.body and task.body.strip():
+    if include_body and task.body and task.body.strip():
         lines.append("## Body")
         lines.append(_cap(task.body, _CTX_MAX_BODY_BYTES))
         lines.append("")
@@ -11095,7 +11101,10 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             size_kb = max(1, (att.size + 1023) // 1024) if att.size else 0
             size_str = f", {size_kb} KB" if size_kb else ""
             ctype = f", {att.content_type}" if att.content_type else ""
-            lines.append(f"- `{att.filename}`{ctype}{size_str} → `{att.stored_path}`")
+            if not include_history and Path(att.stored_path).name == att.filename:
+                lines.append(f"- `{att.stored_path}`{ctype}{size_str}")
+            else:
+                lines.append(f"- `{att.filename}`{ctype}{size_str} → `{att.stored_path}`")
         lines.append("")
 
     # Prior attempts — show closed runs so a retrying worker sees the
@@ -11103,7 +11112,10 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     # Cap at _CTX_MAX_PRIOR_ATTEMPTS most-recent closed runs; older
     # attempts get collapsed into a one-line marker so the worker knows
     # more exist without bloating the prompt.
-    all_prior = [r for r in list_runs(conn, task_id) if r.ended_at is not None]
+    all_prior = (
+        [r for r in list_runs(conn, task_id) if r.ended_at is not None]
+        if include_history else []
+    )
     # list_runs returns ascending by started_at; "most recent" = last N
     if len(all_prior) > _CTX_MAX_PRIOR_ATTEMPTS:
         omitted = len(all_prior) - _CTX_MAX_PRIOR_ATTEMPTS
@@ -11203,7 +11215,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     # the user to wire anything into SOUL.md / MEMORY.md. Bounded to the
     # most recent 5 completed runs, excluding this task so the retry
     # section above isn't duplicated. Safe on assignee=None (skipped).
-    if task.assignee:
+    if include_history and task.assignee:
         role_rows = conn.execute(
             "SELECT t.id, t.title, r.summary, r.ended_at "
             "FROM task_runs r JOIN tasks t ON r.task_id = t.id "
@@ -11228,7 +11240,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     # Comments: cap at the most-recent _CTX_MAX_COMMENTS so
     # comment-storm tasks don't blow out the worker's prompt. Older
     # comments summarised in a one-line marker like prior attempts.
-    all_comments = list_comments(conn, task_id)
+    all_comments = list_comments(conn, task_id) if include_history else []
     if len(all_comments) > _CTX_MAX_COMMENTS:
         omitted_c = len(all_comments) - _CTX_MAX_COMMENTS
         shown_c = all_comments[-_CTX_MAX_COMMENTS:]
