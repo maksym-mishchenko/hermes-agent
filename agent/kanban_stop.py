@@ -1,6 +1,6 @@
 """Turn-end guard for kanban workers.
 
-Kanban workers must end with ``kanban_complete`` or ``kanban_block``. Models
+Kanban workers must complete, block, or hand off to/from review. Models
 (especially GLM / Qwen families) sometimes narrate the next step
 ("Let me write the report now") and stop with ``finish_reason=stop`` and no
 tool calls. Hermes treats that as a clean exit → ``rc=0`` → dispatcher
@@ -13,11 +13,18 @@ loop continues instead of exiting.
 
 from __future__ import annotations
 
+import json
 import os
 from typing import Any, Iterable, Optional
 
 
-_TERMINAL_KANBAN_TOOLS = frozenset({"kanban_complete", "kanban_block"})
+# A review handoff closes this run even when the card has a running successor.
+_TERMINAL_KANBAN_TOOLS = frozenset({
+    "kanban_complete",
+    "kanban_block",
+    "kanban_request_review",
+    "kanban_request_changes",
+})
 
 _DEFAULT_MAX_ATTEMPTS = 2
 
@@ -66,6 +73,51 @@ def session_called_kanban_terminal(messages: Iterable[dict] | None) -> bool:
     return False
 
 
+def _successful_terminal_receipt(messages: Iterable[dict] | None) -> bool:
+    """Accept only a successful terminal result for the current worker run."""
+    task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    raw_run_id = (os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+    if not task_id:
+        return False
+    try:
+        run_id = int(raw_run_id) if raw_run_id else None
+    except ValueError:
+        return False
+    calls: dict[str, str] = {}
+    for msg in messages or ():
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") == "assistant":
+            for call in msg.get("tool_calls") or ():
+                call_id = call.get("id") if isinstance(call, dict) else None
+                name = _tool_call_name(call)
+                if call_id and name in _TERMINAL_KANBAN_TOOLS:
+                    calls[str(call_id)] = name
+            continue
+        if msg.get("role") != "tool":
+            continue
+        name = calls.pop(str(msg.get("tool_call_id") or ""), "")
+        if name not in _TERMINAL_KANBAN_TOOLS:
+            continue
+        if msg.get("name") and msg["name"] != name:
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            try:
+                content = json.loads(content)
+            except (TypeError, json.JSONDecodeError):
+                continue
+        if isinstance(content, dict) and content.get("ok") is True:
+            if content.get("task_id") != task_id:
+                continue
+            if run_id is None or (
+                type(content.get("run_id")) is int
+                and content["run_id"] == run_id
+            ):
+                return True
+    return False
+
+
 def build_kanban_stop_nudge(
     *,
     messages: Iterable[dict] | None = None,
@@ -76,13 +128,13 @@ def build_kanban_stop_nudge(
     """Return a synthetic follow-up when a kanban worker exits without a terminal tool.
 
     Returns ``None`` when the guard should not fire (not a kanban worker,
-    already completed/blocked, or nudge budget exhausted).
+    already reached a terminal worker outcome, or nudge budget exhausted).
     """
     if not kanban_stop_nudge_enabled():
         return None
     if attempts >= max_attempts:
         return None
-    if session_called_kanban_terminal(messages):
+    if _successful_terminal_receipt(messages):
         return None
 
     tid = (task_id or os.environ.get("HERMES_KANBAN_TASK") or "").strip() or "this task"
@@ -95,7 +147,10 @@ def build_kanban_stop_nudge(
         "Do this immediately in your next response — do not narrate intent:\n"
         "1. Finish any remaining deliverable (write the required file(s) now).\n"
         "2. Call `kanban_complete(summary=..., artifacts=[...])` if the work "
-        "is done, OR `kanban_block(reason=...)` if you are blocked.\n\n"
+        "is done, `kanban_request_review(summary=...)` when implementation "
+        "is ready for review, `kanban_request_changes(reason=...)` when "
+        "review finds corrections are needed, OR `kanban_block(reason=...)` if "
+        "you are blocked.\n\n"
         "Never end a turn with only a promise of future action. Repeated "
         "protocol violations will block this task and require manual intervention.]"
     )

@@ -529,9 +529,18 @@ def _handle_show(args: dict, **kw) -> str:
             task = kb.get_task(conn, tid)
             if task is None:
                 return tool_error(f"task {tid} not found")
-            comments = kb.list_comments(conn, tid)
-            events = kb.list_events(conn, tid)
-            runs = kb.list_runs(conn, tid)
+            # Avoid hydrating retry-heavy cards twice: worker_context already
+            # contains capped history and the current handoff.
+            is_worker = bool(os.environ.get("HERMES_KANBAN_TASK"))
+            if "include_history" in args:
+                if not isinstance(args["include_history"], bool):
+                    return tool_error("include_history must be a boolean")
+                include_history = args["include_history"] is True
+            else:
+                include_history = not is_worker
+            comments = kb.list_comments(conn, tid) if include_history else []
+            events = kb.list_events(conn, tid) if include_history else []
+            runs = kb.list_runs(conn, tid) if include_history else []
             parents = kb.parent_ids(conn, tid)
             children = kb.child_ids(conn, tid)
 
@@ -561,6 +570,7 @@ def _handle_show(args: dict, **kw) -> str:
                 }
 
             return json.dumps({
+                "history_included": include_history,
                 "task": _task_dict(task),
                 "parents": parents,
                 "children": children,
@@ -746,12 +756,14 @@ def _handle_complete(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            outgoing_run_id = _worker_run_id(tid)
             # Goal-mode pre-completion judge gate (Issue #38367).
             # Prevent workers from bypassing the auxiliary judge by
             # calling kanban_complete before acceptance criteria are met.
             # Only enforce when a judge is actually reachable — see
             # _goal_judge_available for why an unavailable judge fails open.
             task = kb.get_task(conn, tid)
+            receipt_run_id = outgoing_run_id or (task.current_run_id if task else None)
             rejection = _goal_mode_handoff_rejection(
                 task,
                 (summary or result or "").strip(),
@@ -770,7 +782,7 @@ def _handle_complete(args: dict, **kw) -> str:
                     conn, tid,
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
-                    expected_run_id=_worker_run_id(tid),
+                    expected_run_id=outgoing_run_id,
                 )
             except kb.ArtifactPreservationError as artifact_err:
                 return tool_error(
@@ -803,8 +815,7 @@ def _handle_complete(args: dict, **kw) -> str:
                 return tool_error(
                     f"could not complete {tid} (unknown id or already terminal)"
                 )
-            run = kb.latest_run(conn, tid)
-            return _ok(task_id=tid, run_id=run.id if run else None)
+            return _ok(task_id=tid, run_id=receipt_run_id)
         finally:
             conn.close()
     except ValueError as e:
@@ -865,24 +876,25 @@ def _handle_block(args: dict, **kw) -> str:
                 f"completion judge will evaluate it."
             )
         try:
+            outgoing_run_id = _worker_run_id(tid)
+            receipt_run_id = outgoing_run_id or (task.current_run_id if task else None)
             ok = kb.block_task(
                 conn, tid,
                 reason=reason,
                 kind=kind,
-                expected_run_id=_worker_run_id(tid),
+                expected_run_id=outgoing_run_id,
             )
             if not ok:
                 return tool_error(
                     f"could not block {tid} (unknown id or not in "
                     f"running/ready)"
                 )
-            run = kb.latest_run(conn, tid)
             # Tell the worker where the task actually landed so it doesn't
             # assume it's sitting in 'blocked' when routing sent it elsewhere.
             landed = kb.get_task(conn, tid)
             return _ok(
                 task_id=tid,
-                run_id=run.id if run else None,
+                run_id=receipt_run_id,
                 status=landed.status if landed else "blocked",
                 block_kind=kind,
             )
@@ -936,7 +948,9 @@ def _handle_request_review(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            outgoing_run_id = _worker_run_id(tid)
             task = kb.get_task(conn, tid)
+            receipt_run_id = outgoing_run_id or (task.current_run_id if task else None)
             rejection = _goal_mode_handoff_rejection(task, summary)
             if rejection is not None:
                 return tool_error(
@@ -949,7 +963,7 @@ def _handle_request_review(args: dict, **kw) -> str:
                 summary=summary,
                 metadata=metadata,
                 reviewer=reviewer,
-                expected_run_id=_worker_run_id(tid),
+                expected_run_id=outgoing_run_id,
                 with_reason=True,
             )
             if not ok:
@@ -957,11 +971,10 @@ def _handle_request_review(args: dict, **kw) -> str:
                 return tool_error(
                     f"could not request review for {tid}: {detail}"
                 )
-            run = kb.latest_run(conn, tid)
             landed = kb.get_task(conn, tid)
             return _ok(
                 task_id=tid,
-                run_id=run.id if run else None,
+                run_id=receipt_run_id,
                 status=landed.status if landed else "review",
             )
         finally:
@@ -994,21 +1007,23 @@ def _handle_request_changes(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            outgoing_run_id = _worker_run_id(tid)
+            task = kb.get_task(conn, tid)
+            receipt_run_id = outgoing_run_id or (task.current_run_id if task else None)
             ok, detail = kb.request_changes(
                 conn,
                 tid,
                 reason=reason,
-                expected_run_id=_worker_run_id(tid),
+                expected_run_id=outgoing_run_id,
             )
             if not ok:
                 return tool_error(
                     f"could not request changes for {tid}: {detail or 'invalid review state'}"
                 )
             landed = kb.get_task(conn, tid)
-            run = kb.latest_run(conn, tid)
             return _ok(
                 task_id=tid,
-                run_id=run.id if run else None,
+                run_id=receipt_run_id,
                 status=landed.status if landed else "ready",
                 implementer=detail,
             )
@@ -1700,8 +1715,11 @@ KANBAN_SHOW_SCHEMA = {
         "handoffs, your prior attempts on this task if any, comments, "
         "and recent events. Use this to (re)orient yourself before "
         "starting work, especially on retries. The response includes a "
-        "pre-formatted ``worker_context`` string suitable for inclusion "
-        "verbatim in your reasoning."
+        "bounded ``worker_context`` with the current handoff. Read it once, "
+        "retain the relevant evidence, and refresh only when the task changes. "
+        "Worker calls omit duplicated comments, "
+        "runs, and events by default; pass ``include_history=true`` when "
+        "full diagnostic history is specifically needed."
     ),
     "parameters": {
         "type": "object",
@@ -1711,6 +1729,14 @@ KANBAN_SHOW_SCHEMA = {
                 "description": _DESC_TASK_ID_DEFAULT,
             },
             "board": _board_schema_prop(),
+            "include_history": {
+                "type": "boolean",
+                "description": (
+                    "Include raw comments, runs, and events in addition to "
+                    "the bounded worker_context. Defaults to false for "
+                    "dispatcher workers and true for orchestrators."
+                ),
+            },
         },
         "required": [],
     },
