@@ -527,6 +527,96 @@ def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
     assert captured == [["domain-specific-review", "sdlc-review"]]
 
 
+def test_active_pr_guard_allows_explicit_changes_requested_requeue(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="rework", assignee="worker")
+        kb.claim_task(conn, task_id)
+        implementation_run = kb.get_task(conn, task_id).current_run_id
+        kb.add_comment(
+            conn, task_id, author="worker",
+            body="Opened https://github.com/example/repo/pull/749",
+        )
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+        assert kb.request_review(
+            conn, task_id, summary="Review existing PR749", reviewer="reviewer",
+            expected_run_id=implementation_run,
+        )
+        assert kb.claim_review_task(conn, task_id) is not None
+        review_run = kb.get_task(conn, task_id).current_run_id
+        assert kb.request_changes(
+            conn, task_id, reason="Fix the failing assertion",
+            expected_run_id=review_run,
+        )[0]
+        assert kb.check_respawn_guard(conn, task_id) is None
+        task = kb.get_task(conn, task_id)
+        assert task.status == "ready"
+        assert task.assignee == "worker"
+        assert "749" in kb.build_worker_context(conn, task_id)
+
+
+@pytest.mark.parametrize("kind,payload,allowed", [
+    ("status", {"status": "ready"}, True),
+    ("status", {"status": "todo"}, True),
+    ("unblocked", None, True),
+    ("promoted", None, False),
+    ("reclaimed", None, False),
+    ("status", {"status": "running"}, False),
+    ("status", {"status": "todo", "reason": "ancestor_reopened"}, False),
+])
+def test_active_pr_requires_explicit_rework(
+    kanban_home, kind, payload, allowed,
+):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="existing PR", assignee="worker")
+        kb.add_comment(conn, tid, "worker", "https://github.com/example/repo/pull/749")
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, kind, payload)
+        assert kb.check_respawn_guard(conn, tid) == (None if allowed else "active_pr")
+
+
+def test_requeue_before_pr_in_same_second_does_not_bypass_guard(kanban_home, monkeypatch):
+    monkeypatch.setattr(kb.time, "time", lambda: 1_900_000_000)
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="new PR after requeue", assignee="worker")
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "changes_requested", {"reason": "Earlier work"})
+        kb.add_comment(conn, tid, "worker", "https://github.com/example/repo/pull/749")
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+
+
+def test_unrelated_comment_does_not_cancel_same_second_rework(kanban_home, monkeypatch):
+    monkeypatch.setattr(kb.time, "time", lambda: 1_900_000_000)
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="reuse existing PR", assignee="worker")
+        kb.add_comment(conn, tid, "worker", "https://github.com/example/repo/pull/749")
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "status", {"status": "ready"})
+        kb.add_comment(conn, tid, "operator", "Continue on the existing branch")
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
+@pytest.mark.parametrize("review", [False, True])
+def test_missing_profile_is_diagnostic_not_a_spawn_loop(kanban_home, monkeypatch, review):
+    import hermes_cli.config as cfgmod
+
+    monkeypatch.setattr(
+        cfgmod, "load_config",
+        lambda *a, **k: {"kanban": {"review_dispatch": True, "auto_decompose": False}},
+    )
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="isolated reproduction", assignee="missing-worker")
+        if review:
+            assert kb.request_review(conn, tid, summary="Review the reproduction")
+        original_status = kb.get_task(conn, tid).status
+        original_runs = kb.list_runs(conn, tid)
+        for _ in range(2):
+            result = kb.dispatch_once(conn, dry_run=True)
+            assert tid in result.skipped_nonspawnable
+            assert not result.spawned
+            assert kb.get_task(conn, tid).status == original_status
+            assert kb.list_runs(conn, tid) == original_runs
+
+
 def test_review_dispatch_honors_global_and_per_profile_caps(
     kanban_home: Path,
     monkeypatch: pytest.MonkeyPatch,

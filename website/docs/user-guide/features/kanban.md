@@ -294,7 +294,7 @@ parent, missing input, unmet capability) before unblocking, or raise
 
 | Tool | Purpose | Required params |
 |---|---|---|
-| `kanban_show` | Read the current task (title, body, prior attempts, parent handoffs, comments, full pre-formatted `worker_context`). Defaults to the env's task id. | — |
+| `kanban_show` | Read the current task (title, body, prior attempts, parent handoffs, comments, full pre-formatted `worker_context`). Defaults to the env's task id. Worker calls use the bounded `worker_context` without duplicating raw history; pass `include_history: true` for diagnostic comments/runs/events. Orchestrators include raw history by default and can pass `include_history: false` for the compact form. | — |
 | `kanban_list` | List task summaries with filters for `assignee`, `status`, `tenant`, archived visibility, and limit. Intended for orchestrators discovering board work. | — |
 | `kanban_complete` | Finish with `summary` + `metadata` structured handoff. | at least one of `summary` / `result` |
 | `kanban_request_review` | Start same-card review with a durable `summary`, optional `metadata`, and optional reviewer profile. The task moves to `review`; this is not a block. | `summary` |
@@ -308,6 +308,30 @@ parent, missing input, unmet capability) before unblocking, or raise
 | `kanban_create` | (Orchestrators) fan out into child tasks with an `assignee`, optional `parents`, `skills`, etc. | `title`, `assignee` |
 | `kanban_link` | (Orchestrators) add a `parent_id → child_id` dependency edge after the fact. | `parent_id`, `child_id` |
 | `kanban_unblock` | (Orchestrators) restore a blocked task to its source phase (`review` or `ready`), or `todo` while a parent remains open. | `task_id` |
+
+Successful completion, blocking, and review handoffs are terminal for the
+**outgoing run**, even if the next worker has already claimed the card.
+Workers should stop after the successful receipt rather than also completing
+or blocking the successor's work. Failed tool calls are not terminal receipts.
+
+For retries with an existing PR, reuse that PR and its branch. A review
+correction (`kanban_request_changes`) or explicit operator requeue/unblock
+after the PR comment permits same-card rework; automatic promotion or stale
+claim reclamation alone does not bypass the duplicate-PR guard. Parent
+dependencies, ownership checks, and provider cooldowns still apply.
+
+Compact `kanban_show` responses set `history_included: false`; empty raw-history
+arrays then mean **omitted**, not that there are no prior attempts or comments.
+Read the bounded `worker_context` once for the current handoff, retain the
+relevant evidence in your working notes, and request full history only when
+diagnosing a specific gap. This does not change context compression settings.
+
+Nonexistent assignee profiles are reported as `skipped_nonspawnable` by the
+dispatcher, not repeatedly launched. Such names can also intentionally denote
+manual terminal lanes. Do not create placeholder profiles to make an accidental
+reproduction card dispatch. Tests and reproductions must use a temporary
+`HERMES_HOME` and board; a blank body or unresolved scratch workspace is not,
+by itself, invalid task context.
 
 A typical worker turn looks like:
 

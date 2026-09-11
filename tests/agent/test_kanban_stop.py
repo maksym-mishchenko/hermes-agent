@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from agent.kanban_stop import (
@@ -13,7 +15,9 @@ from agent.kanban_stop import (
 
 @pytest.fixture
 def clear_kanban_env(monkeypatch):
-    for var in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_STOP_NUDGE"):
+    for var in (
+        "HERMES_KANBAN_TASK", "HERMES_KANBAN_STOP_NUDGE", "HERMES_KANBAN_RUN_ID",
+    ):
         monkeypatch.delenv(var, raising=False)
     return monkeypatch
 
@@ -68,11 +72,94 @@ def test_no_nudge_after_kanban_complete(clear_kanban_env):
                 }
             ],
         },
-        {"role": "tool", "name": "kanban_complete", "tool_call_id": "1", "content": "done"},
+        {"role": "tool", "name": "kanban_complete", "tool_call_id": "1",
+         "content": '{"ok": true, "task_id": "t_abc", "run_id": 22}'},
     ]
     assert session_called_kanban_terminal(messages) is True
     assert build_kanban_stop_nudge(messages=messages) is None
 
+
+@pytest.mark.parametrize(
+    "tool_name", ["kanban_request_review", "kanban_request_changes"]
+)
+def test_review_handoff_is_terminal_for_outgoing_run(clear_kanban_env, tool_name):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    clear_kanban_env.setenv("HERMES_KANBAN_RUN_ID", "22")
+    messages = [
+        {
+            "role": "assistant",
+            "tool_calls": [{"id": "handoff", "function": {"name": tool_name}}],
+        },
+        {"role": "tool", "tool_call_id": "handoff",
+         "content": '{"ok": true, "task_id": "t_abc", "run_id": 22}'},
+    ]
+    assert session_called_kanban_terminal(messages) is True
+    assert build_kanban_stop_nudge(messages=messages) is None
+
+
+def test_historic_terminal_call_does_not_close_current_run(clear_kanban_env):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    clear_kanban_env.setenv("HERMES_KANBAN_RUN_ID", "22")
+    messages = [{
+        "role": "tool",
+        "name": "kanban_request_review",
+        "content": '{"ok": true, "task_id": "t_abc", "run_id": 21}',
+    }]
+    assert build_kanban_stop_nudge(messages=messages) is not None
+
+
+@pytest.mark.parametrize("receipt", [
+    {"ok": False, "task_id": "t_abc", "run_id": 22},
+    {"ok": True, "task_id": "t_other", "run_id": 22},
+    {"ok": True, "task_id": "t_abc", "run_id": 21},
+    {"ok": True, "task_id": "t_abc", "run_id": 22.5},
+    {"ok": True, "task_id": "t_abc"},
+    {"error": "ownership mismatch"},
+    "malformed",
+])
+def test_invalid_receipt_does_not_suppress_nudge(clear_kanban_env, receipt):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    clear_kanban_env.setenv("HERMES_KANBAN_RUN_ID", "22")
+    messages = [
+        {"role": "assistant", "tool_calls": [
+            {"id": "handoff", "function": {"name": "kanban_request_review"}},
+        ]},
+        {"role": "tool", "tool_call_id": "handoff",
+         "content": json.dumps(receipt)},
+    ]
+    assert build_kanban_stop_nudge(messages=messages) is not None
+
+
+def test_unpaired_receipt_does_not_suppress_nudge(clear_kanban_env):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    clear_kanban_env.setenv("HERMES_KANBAN_RUN_ID", "22")
+    messages = [{"role": "tool", "name": "kanban_request_review",
+                 "tool_call_id": "unknown",
+                 "content": '{"ok": true, "task_id": "t_abc", "run_id": 22}'}]
+    assert build_kanban_stop_nudge(messages=messages) is not None
+
+
+def test_no_run_id_still_requires_success(clear_kanban_env):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    messages = [{"role": "assistant", "tool_calls": [
+        {"id": "handoff", "function": {"name": "kanban_request_review"}},
+    ]}]
+    assert build_kanban_stop_nudge(messages=messages) is not None
+
+
+def test_terminal_tool_call_without_success_receipt_does_not_close_run(
+    clear_kanban_env,
+):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    clear_kanban_env.setenv("HERMES_KANBAN_RUN_ID", "22")
+    messages = [{
+        "role": "assistant",
+        "tool_calls": [{
+            "id": "call-1",
+            "function": {"name": "kanban_request_review"},
+        }],
+    }]
+    assert build_kanban_stop_nudge(messages=messages) is not None
 
 
 
@@ -84,7 +171,3 @@ def test_no_nudge_after_kanban_complete(clear_kanban_env):
 # without a terminal call, the dispatcher's bounded retry (streak of 3)
 # handles it.  See also tests/hermes_cli/test_kanban_core_functionality.py
 # for the dispatcher-side streak tests.
-
-
-
-

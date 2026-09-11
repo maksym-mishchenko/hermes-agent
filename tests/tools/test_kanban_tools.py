@@ -80,6 +80,124 @@ def test_show_defaults_to_env_task_id(worker_env):
     assert "runs" in d
 
 
+@pytest.mark.parametrize("worker,include_history,expected", [
+    (True, None, False), (False, None, True),
+    (True, True, True), (False, False, False),
+])
+def test_show_history_is_explicit_and_preserves_handoff(
+    worker_env, monkeypatch, worker, include_history, expected,
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect() as conn:
+        kb.add_comment(conn, worker_env, "reviewer", "Correct the receipt race")
+    if not worker:
+        monkeypatch.delenv("HERMES_KANBAN_TASK")
+    args = {"task_id": worker_env}
+    if include_history is not None:
+        args["include_history"] = include_history
+    result = json.loads(kt._handle_show(args))
+    assert result["history_included"] is expected
+    assert bool(result["comments"]) is expected
+    assert bool(result["events"]) is expected
+    assert bool(result["runs"]) is expected
+    assert "Correct the receipt race" in result["worker_context"]
+
+
+def test_show_retry_history_does_not_dominate_worker_response(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect() as conn:
+        for index in range(80):
+            kb.add_comment(conn, worker_env, "reviewer", f"{index}: " + "evidence " * 1000)
+        kb.add_comment(conn, worker_env, "reviewer", "LATEST correction: verify outgoing run")
+    compact = kt._handle_show({})
+    full = kt._handle_show({"include_history": True})
+    assert len(compact) < len(full) / 4
+    assert "LATEST correction: verify outgoing run" in json.loads(compact)["worker_context"]
+    assert json.loads(full)["task"] == json.loads(compact)["task"]
+
+
+@pytest.mark.parametrize("tool_name,arguments", [
+    ("kanban_complete", {"summary": "Finished"}),
+    ("kanban_block", {"reason": "Needs operator input"}),
+    ("kanban_request_review", {"summary": "Ready for independent review", "reviewer": "reviewer"}),
+    ("kanban_request_changes", {"reason": "Fix receipt ownership"}),
+])
+def test_real_terminal_receipt_closes_only_outgoing_run(
+    worker_env, monkeypatch, tool_name, arguments,
+):
+    from agent.kanban_stop import build_kanban_stop_nudge
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect() as conn:
+        run_id = kb.get_task(conn, worker_env).current_run_id
+        if tool_name == "kanban_request_changes":
+            assert kb.request_review(
+                conn, worker_env, reviewer="reviewer", expected_run_id=run_id,
+            )
+            assert kb.claim_review_task(conn, worker_env) is not None
+            run_id = kb.get_task(conn, worker_env).current_run_id
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    handler = getattr(kt, "_handle_" + tool_name.removeprefix("kanban_"))
+    receipt = handler(arguments)
+    assert json.loads(receipt)["ok"] is True, receipt
+    assert json.loads(receipt)["run_id"] == run_id
+    messages = [
+        {"role": "assistant", "tool_calls": [
+            {"id": "terminal", "function": {"name": tool_name}},
+        ]},
+        {"role": "tool", "tool_call_id": "terminal", "content": receipt},
+    ]
+    assert build_kanban_stop_nudge(messages=messages) is None
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id + 1))
+    assert build_kanban_stop_nudge(messages=messages) is not None
+
+
+@pytest.mark.parametrize("action", ["request_review", "request_changes"])
+def test_handoff_receipt_survives_successor_claim(
+    worker_env, monkeypatch, action,
+):
+    from agent.kanban_stop import build_kanban_stop_nudge
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect() as conn:
+        run_id = kb.get_task(conn, worker_env).current_run_id
+        if action == "request_changes":
+            assert kb.request_review(conn, worker_env, reviewer="reviewer", expected_run_id=run_id)
+            assert kb.claim_review_task(conn, worker_env) is not None
+            run_id = kb.get_task(conn, worker_env).current_run_id
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    transition = getattr(kb, action)
+
+    def transition_then_claim(conn, task_id, **kwargs):
+        result = transition(conn, task_id, **kwargs)
+        assert result[0]
+        claim = kb.claim_review_task if action == "request_review" else kb.claim_task
+        assert claim(conn, task_id) is not None
+        assert kb.get_task(conn, task_id).current_run_id != run_id
+        return result
+
+    monkeypatch.setattr(kb, action, transition_then_claim)
+    receipt = getattr(kt, "_handle_" + action)(
+        {"summary": "Ready", "reviewer": "reviewer"} if action == "request_review"
+        else {"reason": "Needs corrections"}
+    )
+    assert json.loads(receipt)["ok"] is True, receipt
+    assert json.loads(receipt)["run_id"] == run_id
+    messages = [
+        {"role": "assistant", "tool_calls": [
+            {"id": "handoff", "function": {"name": "kanban_" + action}},
+        ]},
+        {"role": "tool", "tool_call_id": "handoff", "content": receipt},
+    ]
+    assert build_kanban_stop_nudge(messages=messages) is None
+
+
 def test_list_filters_tasks(monkeypatch, worker_env):
     """kanban_list gives orchestrators filtered board discovery."""
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)

@@ -3999,7 +3999,10 @@ def add_comment(
             "VALUES (?, ?, ?, ?)",
             (task_id, author.strip(), body.strip(), now),
         )
-        _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
+        _append_event(
+            conn, task_id, "commented",
+            {"author": author, "len": len(body), "comment_id": cur.lastrowid},
+        )
         return int(cur.lastrowid or 0)
 
 
@@ -9438,6 +9441,8 @@ def check_respawn_guard(
         A GitHub PR URL appears in a recent task comment (within
         ``_RESPAWN_GUARD_PR_WINDOW`` seconds).  A prior worker already
         opened a PR; re-spawning risks a duplicate PR on the same task.
+        A subsequent explicit status requeue, unblock, or review correction
+        authorizes same-card rework. Automatic promotion/reclaim does not.
 
     Stale / dead claim locks are NOT a guard reason — they are handled
     by ``release_stale_claims`` and ``detect_crashed_workers`` which
@@ -9518,7 +9523,8 @@ def check_respawn_guard(
         requeued_after = conn.execute(
             "SELECT 1 FROM task_events "
             "WHERE task_id = ? AND created_at >= ? "
-            "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed') "
+            "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed', "
+            "'changes_requested') "
             "LIMIT 1",
             (task_id, completed_at),
         ).fetchone()
@@ -9527,11 +9533,48 @@ def check_respawn_guard(
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
+    recent_pr_comment_at = None
+    recent_pr_comment_id = None
     for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+        "SELECT id, body, created_at FROM task_comments "
+        "WHERE task_id = ? AND created_at >= ? ORDER BY created_at, id",
         (task_id, pr_cutoff),
     ).fetchall():
         if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+            recent_pr_comment_at = int(c["created_at"] or 0)
+            recent_pr_comment_id = c["id"]
+    if recent_pr_comment_at is not None:
+        # Timestamps have second precision. Use event ordering as well so an
+        # earlier requeue in the same second cannot authorize a later PR.
+        comment_event = conn.execute(
+            "SELECT MAX(id) FROM task_events WHERE task_id = ? "
+            "AND kind = 'commented' AND json_valid(payload) "
+            "AND json_extract(payload, '$.comment_id') = ?",
+            (task_id, recent_pr_comment_id),
+        ).fetchone()[0]
+        requeued_after_pr = False
+        for event in conn.execute(
+            "SELECT kind, payload FROM task_events "
+            "WHERE task_id = ? AND (created_at > ? OR "
+            "(created_at = ? AND ? IS NOT NULL AND id > ?)) "
+            "AND kind IN ('changes_requested', 'status', 'unblocked')",
+            (task_id, recent_pr_comment_at, recent_pr_comment_at,
+             comment_event, comment_event),
+        ).fetchall():
+            if event["kind"] == "status":
+                try:
+                    payload = json.loads(event["payload"] or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if (
+                    not isinstance(payload, dict)
+                    or payload.get("status") not in {"ready", "todo"}
+                    or payload.get("reason") == "ancestor_reopened"
+                ):
+                    continue
+            requeued_after_pr = True
+            break
+        if not requeued_after_pr:
             return "active_pr"
 
     return None
