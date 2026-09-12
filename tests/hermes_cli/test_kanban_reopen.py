@@ -7,11 +7,12 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli.kanban_db_connect import connect
 
 
 @pytest.fixture
 def conn(tmp_path: Path):
-    connection = kb.connect(tmp_path / "kanban.db")
+    connection = connect(tmp_path / "kanban.db")
     try:
         yield connection
     finally:
@@ -125,7 +126,7 @@ def test_reopen_tool_is_orchestrator_only_and_returns_audit_result(tmp_path, mon
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb._INITIALIZED_PATHS.clear()
     kb.init_db()
-    with kb.connect() as connection:
+    with connect() as connection:
         task_id = _done_task(connection, "tool target", "programmer2")
 
     from tools import kanban_tools as kt
@@ -149,9 +150,9 @@ def test_reopen_tool_keeps_explicit_boards_isolated(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb._INITIALIZED_PATHS.clear()
 
-    with kb.connect(board="alpha") as alpha_conn:
+    with connect(board="alpha") as alpha_conn:
         alpha_id = _done_task(alpha_conn, "alpha target")
-    with kb.connect(board="beta") as beta_conn:
+    with connect(board="beta") as beta_conn:
         beta_id = _done_task(beta_conn, "beta target")
 
     from tools import kanban_tools as kt
@@ -162,10 +163,10 @@ def test_reopen_tool_keeps_explicit_boards_isolated(tmp_path, monkeypatch):
         "board": "alpha",
     }))
     assert result["ok"] is True
-    with kb.connect(board="alpha") as alpha_conn:
+    with connect(board="alpha") as alpha_conn:
         alpha = kb.get_task(alpha_conn, alpha_id)
         assert alpha is not None and alpha.status == "ready"
-    with kb.connect(board="beta") as beta_conn:
+    with connect(board="beta") as beta_conn:
         beta = kb.get_task(beta_conn, beta_id)
         assert beta is not None and beta.status == "done"
 
