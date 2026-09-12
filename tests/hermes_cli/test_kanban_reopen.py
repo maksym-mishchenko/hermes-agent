@@ -99,10 +99,21 @@ def test_reopen_rejects_live_target_or_descendant_without_mutation(conn):
 
 def test_reopen_rejects_unsupported_status_and_reason(conn):
     task_id = kb.create_task(conn, title="ready", assignee="worker")
-    with pytest.raises(ValueError, match="only done or archived"):
+    with pytest.raises(ValueError, match="only done"):
         kb.reopen_task(conn, task_id, reason="not done", author="operator")
     with pytest.raises(ValueError, match="reason"):
         kb.reopen_task(conn, task_id, reason=" ", author="operator")
+
+
+def test_reopen_rejects_archived_without_mutation(conn):
+    task_id = _done_task(conn, "archived", "worker")
+    assert kb.archive_task(conn, task_id)
+    before = list(conn.iterdump())
+
+    with pytest.raises(ValueError, match="only done"):
+        kb.reopen_task(conn, task_id, reason="archived work must stay terminal")
+
+    assert list(conn.iterdump()) == before
 
 
 def test_reopen_tool_is_orchestrator_only_and_returns_audit_result(tmp_path, monkeypatch):

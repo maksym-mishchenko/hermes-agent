@@ -3439,9 +3439,10 @@ def reopen_task(
 ) -> dict[str, Any]:
     """Reopen a completed task and retract stale descendant verification.
 
-    This is the audited domain operation for a ``done``/``archived`` task
-    returning to ``ready`` when its parents are satisfied, or ``todo`` when
-    they are not.  The target and every descendant are checked while holding
+    This is the audited domain operation for a ``done`` task returning to
+    ``ready`` when its parents are satisfied, or ``todo`` when they are not.
+    Archived tasks are terminal and cannot be revived through this operation.
+    The target and every descendant are checked while holding
     the write transaction: any running task or open run rejects the whole
     operation before it mutates anything.  This deliberately differs from
     the dashboard's older direct-status path, which could terminate a live
@@ -3463,8 +3464,8 @@ def reopen_task(
         if task is None:
             raise ValueError(f"task {task_id} not found")
         prior_status = task["status"]
-        if prior_status not in {"done", "archived"}:
-            raise ValueError("only done or archived tasks can be reopened")
+        if prior_status != "done":
+            raise ValueError("only done tasks can be reopened")
 
         live = conn.execute(
             """
@@ -3501,7 +3502,7 @@ def reopen_task(
                    worker_pid = NULL, current_run_id = NULL,
                    block_kind = NULL, block_recurrences = 0,
                    consecutive_failures = 0
-             WHERE id = ? AND status IN ('done', 'archived')
+             WHERE id = ? AND status = 'done'
             """,
             (new_status, task_id),
         )
