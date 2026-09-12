@@ -500,6 +500,25 @@ KANBAN_UNBLOCK_SCHEMA = _schema(
     ["task_id"],
 )
 
+KANBAN_REOPEN_SCHEMA = _schema(
+    "kanban_reopen",
+    (
+        "Reopen a completed Kanban task through the guarded native operation. "
+        "A done task lands in ready when all parents are done, or todo while "
+        "parents remain open; archived tasks are terminal and rejected. "
+        "Completed descendants whose work depended on the reopened result are "
+        "invalidated and re-gated. The operation fails closed if the target or "
+        "any affected descendant has a live run, preserving all state. "
+        "Orchestrator-only; this does not overload kanban_unblock, which remains "
+        "blocked-task only."
+    ),
+    {
+        "task_id": _prop("string", "Completed task id to reopen."),
+        "reason": _prop("string", "Mandatory audit reason for reopening completed work."),
+    },
+    ["task_id", "reason"],
+)
+
 KANBAN_LINK_SCHEMA = _schema(
     "kanban_link",
     (

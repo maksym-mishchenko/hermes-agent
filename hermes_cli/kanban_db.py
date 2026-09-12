@@ -3430,6 +3430,131 @@ def invalidate_descendants_for_parent_reopen(
     return {"invalidated": invalidated, "terminations": terminations}
 
 
+def reopen_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: str,
+    author: str = "operator",
+) -> dict[str, Any]:
+    """Reopen a completed task and retract stale descendant verification.
+
+    This is the audited domain operation for a ``done``/``archived`` task
+    returning to ``ready`` when its parents are satisfied, or ``todo`` when
+    they are not.  The target and every descendant are checked while holding
+    the write transaction: any running task or open run rejects the whole
+    operation before it mutates anything.  This deliberately differs from
+    the dashboard's older direct-status path, which could terminate a live
+    worker while retracting its subtree.
+
+    ``reason`` is recorded on both a task event and a comment.  Existing
+    assignee, result, links, and run history are retained; only the current
+    completion/claim state is cleared.
+    """
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError("reason is required")
+    reason = reason.strip()
+    author = (author or "operator").strip() or "operator"
+    now = int(time.time())
+    with write_txn(conn):
+        task = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if task is None:
+            raise ValueError(f"task {task_id} not found")
+        prior_status = task["status"]
+        if prior_status not in {"done", "archived"}:
+            raise ValueError("only done or archived tasks can be reopened")
+
+        live = conn.execute(
+            """
+            WITH RECURSIVE affected(id) AS (
+                SELECT ?
+                UNION
+                SELECT l.child_id
+                FROM task_links l
+                JOIN affected a ON a.id = l.parent_id
+            )
+            SELECT t.id, t.status
+            FROM affected a
+            JOIN tasks t ON t.id = a.id
+            WHERE t.status = 'running'
+               OR EXISTS (
+                   SELECT 1 FROM task_runs r
+                   WHERE r.task_id = t.id AND r.ended_at IS NULL
+               )
+            LIMIT 1
+            """,
+            (task_id,),
+        ).fetchone()
+        if live is not None:
+            raise ValueError(
+                f"cannot reopen {task_id}: affected task {live['id']} has a live run"
+            )
+
+        new_status = _landing_status_after_parents(conn, task_id)
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status = ?, completed_at = NULL,
+                   claim_lock = NULL, claim_expires = NULL,
+                   worker_pid = NULL, current_run_id = NULL,
+                   block_kind = NULL, block_recurrences = 0,
+                   consecutive_failures = 0
+             WHERE id = ? AND status IN ('done', 'archived')
+            """,
+            (new_status, task_id),
+        )
+        if cur.rowcount != 1:
+            raise ValueError(f"task {task_id} changed before it could be reopened")
+
+        _append_event(
+            conn,
+            task_id,
+            "reopened",
+            {
+                "prior_status": prior_status,
+                "status": new_status,
+                "reason": reason,
+            },
+        )
+        _append_event(
+            conn,
+            task_id,
+            "status",
+            {
+                "status": new_status,
+                "requested_status": new_status,
+                "reason": "reopened",
+            },
+        )
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                task_id,
+                author,
+                f"Reopened from '{prior_status}' to '{new_status}': {reason}",
+                now,
+            ),
+        )
+        invalidation = invalidate_descendants_for_parent_reopen(
+            conn, task_id, author=author,
+        )
+
+    # A live descendant is rejected above, so this is normally empty. Drain it
+    # defensively if a legacy/inconsistent row slips through the status check.
+    for pid, claim_lock in invalidation["terminations"]:
+        _terminate_reclaimed_worker(pid, claim_lock)
+    return {
+        "task_id": task_id,
+        "prior_status": prior_status,
+        "status": new_status,
+        "reason": reason,
+        "invalidated": invalidation["invalidated"],
+    }
+
+
 def specify_triage_task(
     conn: sqlite3.Connection, task_id: str, *, title: Optional[str] = None,
     body: Optional[str] = None, assignee: Optional[str] = None, author: Optional[str] = None,
