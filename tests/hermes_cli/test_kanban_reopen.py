@@ -174,7 +174,13 @@ def test_reopen_tool_rejects_delegated_child(monkeypatch):
     from tools import kanban_tools as kt
 
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
-    monkeypatch.setattr(kt, "_is_delegated_child_context", lambda: True)
+    monkeypatch.setattr(
+        kt,
+        "_delegation_ctx",
+        lambda predicate, default: (
+            True if predicate == "is_delegated_child_process_context" else default
+        ),
+    )
     denied = json.loads(kt._handle_reopen({
         "task_id": "t_foreign",
         "reason": "delegated child must not mutate",
