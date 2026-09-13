@@ -221,6 +221,24 @@ The dispatcher runs inside the gateway process. Nothing to install, no
 separate service to manage — if the gateway is up, ready tasks get picked
 up on the next tick (60s by default).
 
+The gateway dispatcher is intentionally a **local SQLite consumer**. It
+reads board rows from the `kanban.db` files described above; it does not poll
+Mission Control or any other remote task API. External queue synchronization
+belongs at the extension boundary: a standalone plugin or companion process
+may validate a remote service, translate its tasks into local Kanban mutations,
+and publish local outcomes back. Such a connector must treat redirects, `404`,
+authentication failures, and every other non-success response as explicit
+errors rather than as an empty queue. Keeping remote transport and credentials
+outside the dispatcher preserves the single-host claim/PID invariants and
+prevents a remote outage from silently looking like “no work.”
+
+For a Mission Control connector, that boundary starts with an uncached
+`GET /api/mission-control/health` preflight, followed by authenticated
+`GET /api/mission-control/tasks`, `POST`/`PATCH /api/mission-control/tasks`,
+and `POST /api/mission-control/comments` requests using `X-Dashboard-Token`.
+Report `401` as client authentication failure and `503` as server
+authentication/storage unavailability; neither is an empty queue.
+
 ```yaml
 # config.yaml
 kanban:
