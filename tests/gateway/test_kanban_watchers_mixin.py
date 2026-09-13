@@ -7,8 +7,11 @@ that GatewayRunner picks them up via the MRO (behavior-neutral relocation).
 
 from __future__ import annotations
 
+import asyncio
 import inspect
+from types import SimpleNamespace
 
+import gateway.kanban_watchers as watchers
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 
 KANBAN_METHODS = [
@@ -26,3 +29,86 @@ def test_mixin_defines_kanban_methods():
         assert hasattr(GatewayKanbanWatchersMixin, m), f"mixin missing {m}"
 
 
+def test_dispatcher_retries_contended_lock_and_takes_over(monkeypatch, tmp_path, caplog):
+    """A gateway waiting behind the singleton must dispatch after takeover."""
+    from hermes_cli import config as config_module
+    from hermes_cli import kanban_db_dispatch as dispatch_module
+
+    runner = GatewayKanbanWatchersMixin()
+    runner._running = True
+    runner._kanban_dispatcher_lock_handle = None
+    lock_handle = object()
+    lock_attempts = iter(
+        [(None, "contended"), (None, "unavailable"), (lock_handle, "held")]
+    )
+    monkeypatch.setattr(
+        watchers,
+        "_acquire_singleton_lock",
+        lambda _path: next(lock_attempts),
+    )
+    released = []
+    monkeypatch.setattr(
+        watchers,
+        "_release_singleton_lock",
+        lambda handle: released.append(handle),
+    )
+    monkeypatch.setattr(
+        config_module,
+        "load_config",
+        lambda: {
+            "kanban": {
+                "dispatch_in_gateway": True,
+                "dispatch_interval_seconds": 1,
+                "auto_decompose": False,
+            }
+        },
+    )
+    monkeypatch.setattr(watchers, "_kanban_dispatch_allowed", lambda: True)
+    monkeypatch.setattr(watchers.asyncio, "sleep", lambda _delay: _noop())
+    dispatch_calls = []
+
+    class Dispatcher:
+        def __init__(self, _kb, settings):
+            pass
+
+        def tick_once(self):
+            dispatch_calls.append(True)
+            runner._running = False
+            return [SimpleNamespace(
+                board="default",
+                spawned=[123],
+                reclaimed=0,
+                crashed=[],
+                timed_out=[],
+                promoted=0,
+                auto_blocked=[],
+            )]
+
+        def ready_nonempty(self):
+            return False
+
+    monkeypatch.setattr(watchers, "_KanbanDispatcher", Dispatcher)
+    monkeypatch.setattr(watchers, "_resolve_dispatcher_settings", lambda *_args: SimpleNamespace(interval=1))
+    monkeypatch.setattr(watchers, "_resolve_auto_decompose_settings", lambda *_args: (False, 0))
+    monkeypatch.setattr(watchers, "_log_spawn_results", lambda _results: True)
+    monkeypatch.setattr(watchers, "_to_thread_process_service", lambda fn, *args: _await_value(fn(*args)))
+    monkeypatch.setattr(dispatch_module, "reap_worker_zombies", lambda: [])
+
+    with caplog.at_level("INFO", logger="gateway.run"):
+        asyncio.run(runner._kanban_dispatcher_watcher())
+
+    assert dispatch_calls, "takeover must enter the existing dispatch loop"
+    assert released == [lock_handle]
+    assert runner._kanban_dispatcher_lock_handle is None
+    messages = [record.getMessage() for record in caplog.records]
+    assert sum("waiting to take over" in message for message in messages) == 1
+    assert sum("dispatch remains paused" in message for message in messages) == 1
+    assert any("acquired singleton dispatcher lock after waiting" in message for message in messages)
+
+
+async def _noop():
+    return None
+
+
+async def _await_value(value):
+    return value
