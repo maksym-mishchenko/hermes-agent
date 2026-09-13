@@ -20,6 +20,10 @@ def conn(tmp_path: Path):
         connection.close()
 
 
+def _enable_orchestrator(home: Path) -> None:
+    (home / "config.yaml").write_text("toolsets:\n  - kanban\n", encoding="utf-8")
+
+
 def _triage(conn, title: str = "triage", *, parents=(), assignee="reviewer") -> str:
     return kb.create_task(
         conn,
@@ -156,6 +160,7 @@ def test_release_triage_preserves_failure_block_and_review_history(conn):
 def test_release_triage_tool_dispatches_through_registry(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()
+    _enable_orchestrator(home)
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_PROFILE", "coord")
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
@@ -206,6 +211,7 @@ def test_release_triage_tool_is_visible_only_to_orchestrator_mode(monkeypatch):
 def test_release_tool_is_orchestrator_only_and_actor_is_not_an_argument(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()
+    _enable_orchestrator(home)
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_PROFILE", "server-coordinator")
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
@@ -233,3 +239,76 @@ def test_release_tool_is_orchestrator_only_and_actor_is_not_an_argument(tmp_path
         "reason": "worker must not release triage",
     }))
     assert "orchestrator-only" in denied["error"]
+
+
+def test_release_triage_real_dispatch_denies_profile_without_orchestrator_access(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text("toolsets: []\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "non-orchestrator")
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    with connect() as connection:
+        task_id = _triage(connection)
+        before = list(connection.iterdump())
+
+    from model_tools import handle_function_call
+    from tools import kanban_tools_triage  # noqa: F401
+    from tools.registry import registry
+
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(home / "kanban.db"))
+    direct = json.loads(str(registry.dispatch(
+        "kanban_release_triage", {"task_id": task_id, "reason": "must deny"}
+    )))
+    via_model = json.loads(handle_function_call(
+        "kanban_release_triage",
+        {"task_id": task_id, "reason": "must deny"},
+        skip_pre_tool_call_hook=True,
+        skip_tool_request_middleware=True,
+        skip_tool_execution_middleware=True,
+        enabled_toolsets=["hermes-cli"],
+    ))
+
+    assert "orchestrator" in direct["error"]
+    assert "orchestrator" in via_model["error"]
+    with connect() as connection:
+        assert list(connection.iterdump()) == before
+
+
+@pytest.mark.parametrize("bad_value", [True, 7, ["triage"], {"id": "triage"}, None, " "])
+def test_release_triage_real_dispatch_rejects_non_string_arguments_without_mutation(
+    tmp_path, monkeypatch, bad_value
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    _enable_orchestrator(home)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "coordinator")
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    with connect() as connection:
+        task_id = _triage(connection)
+        before = list(connection.iterdump())
+
+    from tools import kanban_tools_triage  # noqa: F401
+    from tools.registry import registry
+
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(home / "kanban.db"))
+    bad_task = json.loads(str(registry.dispatch(
+        "kanban_release_triage", {"task_id": bad_value, "reason": "valid reason"}
+    )))
+    bad_reason = json.loads(str(registry.dispatch(
+        "kanban_release_triage", {"task_id": task_id, "reason": bad_value}
+    )))
+
+    assert "string" in bad_task["error"] or "required" in bad_task["error"]
+    assert "string" in bad_reason["error"] or "required" in bad_reason["error"]
+    with connect() as connection:
+        assert list(connection.iterdump()) == before
