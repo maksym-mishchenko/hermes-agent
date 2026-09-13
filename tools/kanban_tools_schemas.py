@@ -519,6 +519,24 @@ KANBAN_REOPEN_SCHEMA = _schema(
     ["task_id", "reason"],
 )
 
+KANBAN_RELEASE_TRIAGE_SCHEMA = _schema(
+    "kanban_release_triage",
+    (
+        "Release a Kanban task from triage through the guarded native operation. "
+        "It moves to ready when all parents are done or archived, otherwise to "
+        "todo. The task id, assignee, reviewer identity, dependency edges, "
+        "review evidence, failure history, block recurrence history, and "
+        "completion contract are preserved. The operation rejects non-triage "
+        "tasks and any live or dangling claim/run, and records an atomic audit "
+        "event. Orchestrator-only; the audit actor is derived by the server."
+    ),
+    {
+        "task_id": _prop("string", "Task id currently in triage."),
+        "reason": _prop("string", "Mandatory nonblank audit reason for releasing triage."),
+    },
+    ["task_id", "reason"],
+)
+
 KANBAN_LINK_SCHEMA = _schema(
     "kanban_link",
     (
