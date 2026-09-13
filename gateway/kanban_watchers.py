@@ -24,6 +24,8 @@ from agent.i18n import t
 # "gateway.run") so extracted log records keep their original logger name.
 logger = logging.getLogger("gateway.run")
 
+_DISPATCHER_LOCK_RETRY_SECONDS = 1.0
+
 
 def _resolve_auto_decompose_settings(
     load_config: Callable[[], Any],
@@ -1242,12 +1244,36 @@ class GatewayKanbanWatchersMixin:
         if _lock_state == "contended":
             logger.info(
                 "kanban dispatcher: another gateway already holds the dispatcher "
-                "lock (%s); this gateway will NOT dispatch.", _lock_path,
+                "lock (%s); waiting to take over.", _lock_path,
             )
-            return
+            unavailable_logged = False
+            while self._running and _lock_state != "held":
+                await asyncio.sleep(_DISPATCHER_LOCK_RETRY_SECONDS)
+                if not self._running:
+                    return
+                _lock_handle, _lock_state = _acquire_singleton_lock(_lock_path)
+                if _lock_state == "unavailable" and not unavailable_logged:
+                    logger.warning(
+                        "kanban dispatcher: singleton lock probe unavailable while "
+                        "waiting at %s; dispatch remains paused until ownership can "
+                        "be proven.",
+                        _lock_path,
+                    )
+                    unavailable_logged = True
+            if not self._running:
+                _release_singleton_lock(_lock_handle)
+                return
+            logger.info(
+                "kanban dispatcher: acquired singleton dispatcher lock after "
+                "waiting (%s)", _lock_path,
+            )
         if _lock_state == "held":
             self._kanban_dispatcher_lock_handle = _lock_handle  # hold for process lifetime
-            logger.info("kanban dispatcher: holding singleton dispatcher lock (%s)", _lock_path)
+            if _lock_handle is not None:
+                logger.info(
+                    "kanban dispatcher: holding singleton dispatcher lock (%s)",
+                    _lock_path,
+                )
         else:
             logger.warning(
                 "kanban dispatcher: advisory lock unavailable at %s; proceeding "
