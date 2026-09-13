@@ -35,6 +35,7 @@ _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
 _GC_INTERVAL_SECONDS = 3600.0
 _HEALTH_WINDOW = 6
+_DISPATCHER_LOCK_RETRY_SECONDS = 1.0
 
 
 class GatewayKanbanWatchersMixin:
@@ -220,15 +221,8 @@ class GatewayKanbanWatchersMixin:
         _lock_handle, _lock_state = _acquire_singleton_lock(_lock_path)
         if _lock_state == "contended":
             logger.info("kanban dispatcher: another gateway already holds the dispatcher "
-                        "lock (%s); this gateway will NOT dispatch.", _lock_path)
-            return None
-        if _lock_state == "held":
-            self._kanban_dispatcher_lock_handle = _lock_handle  # hold for process lifetime
-            logger.info("kanban dispatcher: holding singleton dispatcher lock (%s)", _lock_path)
-        else:
-            logger.warning("kanban dispatcher: advisory lock unavailable at %s; proceeding "
-                           "on config control alone.", _lock_path)
-        return _load_config, _kb, kanban_cfg
+                        "lock (%s); waiting to take over.", _lock_path)
+        return _load_config, _kb, kanban_cfg, _lock_path, _lock_handle, _lock_state
 
     async def _kanban_dispatcher_watcher(self) -> None:
         """Embedded kanban dispatcher — one tick every `dispatch_interval_seconds`.
@@ -242,7 +236,36 @@ class GatewayKanbanWatchersMixin:
         boot = self._kanban_dispatcher_boot()
         if boot is None:
             return
-        _load_config, _kb, kanban_cfg = boot
+        _load_config, _kb, kanban_cfg, _lock_path, _lock_handle, _lock_state = boot
+        if _lock_state == "contended":
+            unavailable_logged = False
+            while self._running and _lock_state != "held":
+                await asyncio.sleep(_DISPATCHER_LOCK_RETRY_SECONDS)
+                if not self._running:
+                    return
+                _lock_handle, _lock_state = _acquire_singleton_lock(_lock_path)
+                if _lock_state == "unavailable" and not unavailable_logged:
+                    logger.warning(
+                        "kanban dispatcher: singleton lock probe unavailable while "
+                        "waiting at %s; dispatch remains paused until ownership can "
+                        "be proven.",
+                        _lock_path,
+                    )
+                    unavailable_logged = True
+            if not self._running:
+                _release_singleton_lock(_lock_handle)
+                return
+            logger.info(
+                "kanban dispatcher: acquired singleton dispatcher lock after "
+                "waiting (%s)",
+                _lock_path,
+            )
+        if _lock_state == "held":
+            self._kanban_dispatcher_lock_handle = _lock_handle
+            logger.info("kanban dispatcher: holding singleton dispatcher lock (%s)", _lock_path)
+        else:
+            logger.warning("kanban dispatcher: advisory lock unavailable at %s; proceeding "
+                           "on config control alone.", _lock_path)
         settings = _resolve_dispatcher_settings(kanban_cfg, _kb)
         interval = settings.interval
 
