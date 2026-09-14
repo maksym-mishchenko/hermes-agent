@@ -4,6 +4,7 @@ markers after commit."""
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from typing import Any, Callable, Dict, List
 
@@ -52,6 +53,14 @@ def resolve_and_repair_transcript_batch(
             )
         else:
             msg["_canonical_content"] = decoded  # concurrent winner: adopt, don't overwrite
+        if isinstance(msg.get("tool_calls"), list):
+            # Repairs to arguments/IDs happen on a loaded assistant dict. The
+            # row marker must not make that in-place repair process-only.
+            conn.execute(
+                "UPDATE messages SET tool_calls = ? "
+                "WHERE id = ? AND session_id = ? AND active = 1",
+                (json.dumps(msg["tool_calls"]), target_id, session_id),
+            )
     return inserted_rows
 
 

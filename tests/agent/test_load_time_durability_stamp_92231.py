@@ -192,3 +192,28 @@ def test_noop_progress_check_is_marker_insensitive(tmp_path: Path) -> None:
     # Defensive passthrough shapes.
     assert _strip_marker_for_comparison(None) is None
     assert _strip_marker_for_comparison(["not-a-dict"]) == ["not-a-dict"]
+
+
+def test_loaded_argument_repair_is_durable_and_one_shot(tmp_path: Path) -> None:
+    """A repaired loaded assistant row must not heal again on the next send."""
+    from agent.agent_runtime_helpers import sanitize_tool_call_arguments
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("REPAIR", source="cli")
+    db.append_message(
+        "REPAIR", "assistant", "", tool_calls=[{
+            "id": "call-1",
+            "function": {"name": "terminal", "arguments": '{"command":'},
+        }],
+    )
+    loaded = db.get_messages_as_conversation("REPAIR", include_row_ids=True)
+    assert loaded[0].get(_DB_PERSISTED_MARKER_KEY) is True
+
+    assert sanitize_tool_call_arguments(loaded, session_id="REPAIR") == 1
+    assert _DB_PERSISTED_MARKER_KEY not in loaded[0]
+    agent = _make_flush_agent(db, "REPAIR")
+    assert agent._flush_messages_to_session_db(loaded) is True
+
+    reloaded = db.get_messages_as_conversation("REPAIR")
+    assert reloaded[0]["tool_calls"][0]["function"]["arguments"] == "{}"
+    assert sanitize_tool_call_arguments(reloaded, session_id="REPAIR") == 0

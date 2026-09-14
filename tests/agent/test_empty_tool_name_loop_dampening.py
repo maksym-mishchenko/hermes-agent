@@ -28,6 +28,8 @@ import sys
 import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -109,6 +111,13 @@ def _batch_tc_resp(calls: list[tuple[str, str]]) -> dict:
             "finish_reason": "tool_calls"}],
         "usage": {"prompt_tokens": 10, "completion_tokens": 0, "total_tokens": 10},
     }
+
+
+def _duplicate_id_batch_tc_resp(calls: list[tuple[str, str]]) -> dict:
+    response = _batch_tc_resp(calls)
+    for tool_call in response["choices"][0]["message"]["tool_calls"]:
+        tool_call["id"] = "call_duplicate"
+    return response
 
 
 def _text_resp(text: str) -> dict:
@@ -241,6 +250,62 @@ def test_mixed_batch_preserves_tool_call_result_pairing(agent_env):
     )
 
 
+@pytest.mark.asyncio
+async def test_telegram_request_executes_duplicate_id_tools_and_delivers_final(agent_env):
+    """A Telegram turn must preserve both tool calls and deliver its completed answer."""
+    from gateway.config import PlatformConfig
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    agent, handler = agent_env
+    agent.valid_tool_names.add("todo_list")
+    handler.response_queue.append(_duplicate_id_batch_tc_resp([
+        (
+            "todo_list",
+            '{"todos":[{"id":"1","content":"Plan the repair","status":"in_progress"}]}',
+        ),
+        (
+            "todo_list",
+            '{"todos":[{"id":"1","content":"Plan the repair","status":"completed"}]}',
+        ),
+    ]))
+    handler.response_queue.append(_text_resp("Work completed."))
+
+    result = agent.run_conversation(
+        "Plan and complete this coding task.",
+        conversation_history=[],
+        task_id="telegram-e2e",
+    )
+
+    assistant_calls = next(
+        message["tool_calls"]
+        for message in result["messages"]
+        if message.get("role") == "assistant" and message.get("tool_calls")
+    )
+    call_ids = [tool_call["id"] for tool_call in assistant_calls]
+    result_ids = [
+        message["tool_call_id"]
+        for message in result["messages"]
+        if message.get("role") == "tool"
+    ]
+    assert call_ids == ["call_duplicate", "call_duplicate_d2"]
+    assert result_ids == call_ids
+    assert result["final_response"] == "Work completed."
+
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
+    adapter._bot = MagicMock()
+    adapter._bot.send_message = AsyncMock(
+        return_value=SimpleNamespace(message_id=42),
+    )
+    adapter._rich_messages_enabled = False
+
+    delivery = await adapter.send("12345", result["final_response"])
+
+    assert delivery.success is True
+    adapter._bot.send_message.assert_awaited_once()
+    sent_text = adapter._bot.send_message.await_args.kwargs["text"]
+    assert sent_text.replace(r"\.", ".") == "Work completed."
+
+
 
 
 
@@ -264,4 +329,3 @@ def test_invalid_tool_exhaustion_closes_tool_tail(agent_env):
     assert msgs, "expected persisted conversation messages"
     assert msgs[-1].get("role") == "assistant"
     assert "invalid tool call" in (msgs[-1].get("content") or "").lower()
-

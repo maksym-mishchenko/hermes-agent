@@ -19,6 +19,7 @@ from hermes_cli.timeouts import get_provider_request_timeout
 from agent.message_sanitization import (
     _FULL_ARGS_LOG_BOUND, coalesce_tool_call_id, tool_call_id_variants, tool_result_id_variants
 )
+from agent.context_compressor import _DB_PERSISTED_MARKER
 from agent.prompt_builder import STEER_DISPLAY_KIND, steer_user_row
 from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_result_message
 from agent.trajectory import convert_scratchpad_to_think
@@ -252,6 +253,7 @@ def sanitize_tool_call_arguments(
             arguments = function.get("arguments")
             if arguments is None or (isinstance(arguments, str) and not arguments.strip()):
                 function["arguments"] = "{}"
+                msg.pop(_DB_PERSISTED_MARKER, None)
                 continue
             if not isinstance(arguments, str):
                 continue
@@ -273,6 +275,10 @@ def sanitize_tool_call_arguments(
                 function_name, arguments[:_FULL_ARGS_LOG_BOUND],
             )
             function["arguments"] = "{}"
+            if isinstance(msg, dict):
+                # This dict may have come from SessionDB. Its durable marker
+                # is valid only for the bytes originally written.
+                msg.pop(_DB_PERSISTED_MARKER, None)
             existing_tool_msg = _find_tool_result(messages, message_index + 1, tool_call)
             if existing_tool_msg is None:
                 messages.insert(

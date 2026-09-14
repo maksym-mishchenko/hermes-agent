@@ -174,6 +174,10 @@ _EXTRA_KEYS = frozenset({
     # raw status cannot size a cooldown; persisted so a restart doesn't downgrade
     # a billing bench to a 60s transient cooldown.
     "failure_reason",
+    # The Copilot exchange fallback is a route capability, not a credential
+    # failure.  Keep it attached to the issuing entry so API-error recovery
+    # can fail over without resolving an unrelated ambient token.
+    "copilot_exchange_degraded",
 })
 
 # Nous singleton metadata mirrored between auth.json state and ``entry.extra``.
@@ -2423,6 +2427,7 @@ def _seed_copilot_singleton(seed: _Seeder) -> None:
             "access_token": api_token,
             "base_url": enterprise_base_url or (pconfig.inference_base_url if pconfig else ""),
             "label": source,
+            "copilot_exchange_degraded": api_token == token and not enterprise_base_url,
         })
     except Exception as exc:
         logger.debug("Copilot token seed failed: %s", exc)

@@ -308,11 +308,21 @@ __all__ = [
 
 def _tc_field(tc: Any, key: str) -> Any:
     """Read ``key`` from a tool-call entry that may be a dict or an SDK object."""
+    if key == "_hermes_effective_call_id":
+        return tc.get(key) if isinstance(tc, dict) else getattr(tc, key, None)
     return tc.get(key) if isinstance(tc, dict) else getattr(tc, key, None)
 
 
 def _tc_set(tc: Any, key: str, value: Any) -> None:
-    tc.__setitem__(key, value) if isinstance(tc, dict) else setattr(tc, key, value)
+    if isinstance(tc, dict):
+        tc[key] = value
+        return
+    try:
+        setattr(tc, key, value)
+    except (AttributeError, TypeError):
+        # Frozen SDK models can still expose a mutable __dict__; retaining the
+        # effective ID is preferable to dropping a valid parallel call.
+        object.__setattr__(tc, key, value)
 
 
 # --------------------------------------------------------------------------- call_id policy — single owner
@@ -358,7 +368,11 @@ def coalesce_tool_call_id(tc: Any) -> str:
     """Effective call id of a tool_call entry (dict or object); ``""`` when none. Codex Responses
     carry ``call_id`` (authoritative pairing key), Chat Completions ``id`` only, and bridge ids
     may be ``call_id|response_item_id``."""
-    for raw in (_tc_field(tc, "call_id"), _tc_field(tc, "id")):
+    for raw in (
+        _tc_field(tc, "_hermes_effective_call_id"),
+        _tc_field(tc, "call_id"),
+        _tc_field(tc, "id"),
+    ):
         value = raw.strip() if isinstance(raw, str) else ""
         if value:
             return value.split("|", 1)[0].strip() or value
@@ -391,12 +405,21 @@ def uniquify_tool_call_ids(tool_calls: list) -> list:
         seen.add(new_id)
 
         try:
+            # Some provider SDK models expose read-only id fields. Keep the
+            # effective id on the object as a fallback so reconstruction and
+            # the paired tool result use the same identity.
+            try:
+                _tc_set(tc, "_hermes_effective_call_id", new_id)
+            except (AttributeError, TypeError):
+                pass
             # Keep a composite id's response-item half so the provider's fc_/item id survives.
             old = _tc_field(tc, "id")
             _tc_set(tc, "id", f"{new_id}|{old.split('|', 1)[1]}" if isinstance(old, str) and "|" in old else new_id)
             if _tc_field(tc, "call_id"):
                 _tc_set(tc, "call_id", new_id)
         except Exception:
+            # A frozen SDK object may reject all attributes. The caller still
+            # gets a deterministic warning rather than silently losing a call.
             logger.warning("Could not uniquify duplicate tool call id %s", cid)
             continue
         _fn_name = _tc_field(_tc_field(tc, "function"), "name") or "?"

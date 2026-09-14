@@ -8,6 +8,7 @@ prompt-cache keys) and verify the legacy entry points still delegate here.
 """
 
 from types import SimpleNamespace
+from dataclasses import dataclass
 
 import pytest
 
@@ -152,6 +153,24 @@ class TestUniquifyToolCallIds:
     def test_empty_and_none_inputs(self):
         assert uniquify_tool_call_ids([]) == []
         assert uniquify_tool_call_ids(None) is None
+
+    def test_frozen_provider_object_keeps_effective_duplicate_id(self):
+        @dataclass(frozen=True)
+        class Function:
+            name: str
+            arguments: str
+
+        @dataclass(frozen=True)
+        class ToolCall:
+            id: str
+            function: Function
+
+        calls = [
+            ToolCall("same", Function("one", "{}")),
+            ToolCall("same", Function("two", "{}")),
+        ]
+        uniquify_tool_call_ids(calls)
+        assert coalesce_tool_call_id(calls[1]) == "same_d2"
 
 
 # ---------------------------------------------------------------------------
