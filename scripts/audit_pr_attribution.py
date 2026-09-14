@@ -7,9 +7,11 @@ you are about to push:
 
     python3 scripts/audit_pr_attribution.py            # report only
     python3 scripts/audit_pr_attribution.py --fix      # create mapping files
+    python3 scripts/audit_pr_attribution.py --base-ref origin/production/runtime
 
 Logic (kept in sync with contributor-check.yml):
-  - scans ``git log $(git merge-base origin/main HEAD)..HEAD --format=%ae``
+  - scans commits since the PR's actual base (``--base-ref``, ``GITHUB_BASE_REF``,
+    or ``origin/main`` for ordinary local use)
   - skips teknium/bot emails and ``<id>+<login>@users.noreply.github.com``
     (CI auto-resolves those)
   - everything else must have ``contributors/emails/<email>`` or a legacy
@@ -26,6 +28,7 @@ Logic (kept in sync with contributor-check.yml):
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -55,8 +58,8 @@ def run(*args: str, check: bool = True) -> str:
     return result.stdout.strip()
 
 
-def new_emails() -> list[str]:
-    base = run("git", "merge-base", "origin/main", "HEAD")
+def new_emails(base_ref: str) -> list[str]:
+    base = run("git", "merge-base", base_ref, "HEAD")
     log = run("git", "log", f"{base}..HEAD", "--format=%ae", "--no-merges", check=False)
     return sorted({e for e in log.splitlines() if e.strip()})
 
@@ -103,9 +106,18 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fix", action="store_true",
                         help="auto-create contributors/emails/ mapping files")
+    parser.add_argument(
+        "--base-ref",
+        default=(
+            f"origin/{os.environ['GITHUB_BASE_REF']}"
+            if os.environ.get("GITHUB_BASE_REF")
+            else "origin/main"
+        ),
+        help="git ref used as the PR base (default: GITHUB_BASE_REF or origin/main)",
+    )
     args = parser.parse_args()
 
-    unmapped = [e for e in new_emails() if not is_mapped(e)]
+    unmapped = [e for e in new_emails(args.base_ref) if not is_mapped(e)]
     if not unmapped:
         print("✅ All contributor emails on this branch are mapped.")
         return 0
