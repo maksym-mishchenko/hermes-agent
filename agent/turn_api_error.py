@@ -227,6 +227,24 @@ def _is_local_validation_error(api_error: Any) -> bool:
     return not (isinstance(api_error, TypeError) and "nonetype" in _text and "not iterable" in _text)
 
 
+def _copilot_exchange_degraded(agent: Any) -> bool:
+    """Return whether this request used the pool's known raw-token route.
+
+    Do not re-resolve Copilot credentials here: that can pick up ambient
+    ``GH_TOKEN``/``gh auth`` state and loses the pool entry's attribution.
+    """
+    pool = getattr(agent, "_credential_pool", None)
+    entry_id = getattr(agent, "_credential_pool_entry_id", None)
+    if pool is None or not entry_id:
+        return False
+    try:
+        entries = pool.entries() if callable(pool.entries) else pool.entries
+        entry = next((candidate for candidate in entries if candidate.id == entry_id), None)
+    except Exception:
+        return False
+    return bool(getattr(entry, "copilot_exchange_degraded", False))
+
+
 # Non-retryable per the classifier, yet handled by the overflow/backoff paths instead.
 _RETRYABLE_CLIENT_REASONS = frozenset({
     FailoverReason.rate_limit, FailoverReason.overloaded, FailoverReason.context_overflow,
@@ -292,6 +310,7 @@ def settle_unrecovered_error(
         if (
             _is_copilot_provider(agent)
             and not _retry.copilot_stale_cred_retry_attempted
+            and not _copilot_exchange_degraded(agent)
             and _is_stale_copilot_credential_error(
                 status_code, str(getattr(api_error, "message", "") or api_error)
             )

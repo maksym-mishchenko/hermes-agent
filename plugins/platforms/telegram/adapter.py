@@ -159,6 +159,10 @@ _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 # machinery (delivery ledger, streaming fallback) owns the wait instead of the coroutine pinning its worker
 # — a 97-minute penalty on the boot path froze inbound on every platform (#91969).
 _FLOOD_INLINE_WAIT_CAP_SECS = 5.0
+# The stream consumer already has a fail-closed reconciliation path for a partial
+# edit.  A missing preview is a stronger form of that degradation: none of the
+# preview can be assumed visible, so its fallback must send the complete final.
+_STALE_EDIT_PREFIX = "\x00telegram-stale-edit\x00"
 
 
 def _flood_cap_result(wait: float) -> "SendResult":
@@ -3542,6 +3546,20 @@ class TelegramAdapter(BasePlatformAdapter):
                             float(retry_wait) if retry_wait is not None else wait)
                     return SendResult(success=False, error=safe_retry_error)
             safe_error = _redact_telegram_error_text(e)
+            if "message to edit not found" in err_str:
+                # Telegram has forgotten/deleted the preview.  Do not retry the
+                # edit, and do not classify the preview text as delivered: a
+                # single full final send is the only evidence-gated recovery.
+                return SendResult(
+                    success=False,
+                    error=safe_error,
+                    error_kind="not_found",
+                    raw_response={
+                        "stale_edit": True,
+                        "partial_overflow": True,
+                        "delivered_prefix": _STALE_EDIT_PREFIX,
+                    },
+                )
             # Transient network errors must not permanently disable progress-message editing.
             _transient_markers = (
                 "connecterror", "connect error", "connection error", "networkerror", "network error", "timed out", "readtimeout",

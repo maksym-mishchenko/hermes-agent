@@ -304,11 +304,22 @@ class SessionPersistenceMixin:
         with _persist_lock(self):
             self._drop_trailing_empty_response_scaffolding(messages)
             self._session_messages = messages
-            self._flush_messages_to_session_db(messages, conversation_history)
+            persisted = self._flush_messages_to_session_db(messages, conversation_history)
+            if persisted is False:
+                self._persistence_degraded = True
+                self._turn_persist_failure = True
+                logger.error(
+                    "Session persistence degraded; turn is not durably recorded "
+                    "(session=%s, cause=%s)",
+                    getattr(self, "session_id", None) or "none",
+                    getattr(self, "_last_persistence_error_cause", None) or "unknown",
+                )
+                return False
             # Drain async token-accounting deltas at every persist point; cheap no-op when nothing queued.
             if self._session_db is not None:
                 self._session_db.flush_token_counts()
             note_turn_persisted(self)
+            return True
 
     def _drop_trailing_empty_response_scaffolding(self, messages: List[Dict]) -> None:
         """Pop empty-response retry scaffolding from the tail, then (only if any was present) rewind the

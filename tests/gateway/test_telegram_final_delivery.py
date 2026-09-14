@@ -97,6 +97,59 @@ async def test_non_opt_in_adapter_keeps_adaptive_final_edit_retry():
 
 
 @pytest.mark.asyncio
+async def test_missing_preview_edit_reconciles_with_one_full_final_send():
+    """A deleted preview cannot be used as evidence that its prefix is visible."""
+    adapter = _adapter()
+    adapter.edit_message.return_value = SendResult(
+        success=False,
+        error="Bad Request: message to edit not found",
+        error_kind="not_found",
+        raw_response={
+            "stale_edit": True,
+            "partial_overflow": True,
+            "delivered_prefix": "\x00telegram-stale-edit\x00",
+        },
+    )
+    adapter.send.return_value = SendResult(success=True, message_id="final-1")
+
+    consumer = GatewayStreamConsumer(adapter, "chat-1")
+    consumer._message_id = "preview-1"
+    consumer._last_sent_text = "partial"
+    consumer._already_sent = True
+
+    ok = await consumer._send_or_edit(
+        "partial plus final", finalize=True, is_turn_final=True,
+    )
+
+    assert ok is False
+    await consumer._send_fallback_final("partial plus final")
+
+    adapter.send.assert_awaited_once()
+    assert adapter.send.await_args.kwargs["content"] == "partial plus final"
+    assert consumer.final_content_delivered is True
+
+
+@pytest.mark.asyncio
+async def test_telegram_adapter_types_missing_edit_as_stale_degradation():
+    class MissingMessage(Exception):
+        pass
+
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
+    adapter._bot = MagicMock()
+    adapter._bot.edit_message_text = AsyncMock(
+        side_effect=MissingMessage("Bad Request: message to edit not found"),
+    )
+
+    result = await adapter.edit_message("123", "456", "Final answer", finalize=True)
+
+    assert result.success is False
+    assert result.error_kind == "not_found"
+    assert result.raw_response["stale_edit"] is True
+    assert result.raw_response["partial_overflow"] is True
+    assert result.raw_response["delivered_prefix"] == "\x00telegram-stale-edit\x00"
+
+
+@pytest.mark.asyncio
 async def test_empty_tail_commit_honors_retry_after(monkeypatch):
     adapter = _adapter()
     adapter.send.side_effect = [

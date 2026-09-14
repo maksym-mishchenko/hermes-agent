@@ -1447,7 +1447,10 @@ def _assistant_content_for_storage(agent, assistant_message):
 
 def _assistant_tool_call_dict(agent, tool_call, index: int) -> dict:
     raw_id = getattr(tool_call, "id", None)
+    effective_id = agent._get_tool_call_id_static(tool_call)
     call_id = getattr(tool_call, "call_id", None)
+    if isinstance(effective_id, str) and effective_id.strip():
+        call_id = effective_id
     if not isinstance(call_id, str) or not call_id.strip():
         call_id, _ = agent._split_responses_tool_id(raw_id)
     if not isinstance(call_id, str) or not call_id.strip():
