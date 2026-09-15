@@ -178,7 +178,14 @@ _EXTRA_KEYS = frozenset({
     # failure.  Keep it attached to the issuing entry so API-error recovery
     # can fail over without resolving an unrelated ambient token.
     "copilot_exchange_degraded",
+    "copilot_exchange_state", "copilot_exchange_failure_class",
+    "copilot_exchange_http_status", "copilot_exchange_retry_after",
+    "copilot_exchange_attempts", "copilot_token_source_type",
+    "copilot_reauthorization_required",
 })
+
+_copilot_health_warnings: Set[Tuple[str, str]] = set()
+_copilot_health_warnings_lock = threading.Lock()
 
 # Nous singleton metadata mirrored between auth.json state and ``entry.extra``.
 _NOUS_EXTRA_STATE_KEYS = (
@@ -2391,6 +2398,7 @@ def _seed_copilot_singleton(seed: _Seeder) -> None:
     try:
         from hermes_cli.copilot_auth import (
             COPILOT_ENV_VARS,
+            get_copilot_exchange_health,
             resolve_copilot_token,
             get_copilot_api_token,
         )
@@ -2415,12 +2423,20 @@ def _seed_copilot_singleton(seed: _Seeder) -> None:
         # fails; the Copilot API then routes it to the fallback
         # "copilot-language-server" integrator whose allowlist omits
         # enterprise-only models -> HTTP 400 on every turn. Surface it.
+        exchange_health = get_copilot_exchange_health(token)
+        exchange_state = str(exchange_health.get("state") or "unknown")
         if api_token == token and not enterprise_base_url:
-            logger.warning(
-                "Copilot token exchange degraded to RAW token (exchange "
-                "unavailable); enterprise-only models may 400 with "
-                "model_not_available_for_integrator until exchange recovers."
-            )
+            warning_key = (source_name, exchange_state)
+            with _copilot_health_warnings_lock:
+                first_warning = warning_key not in _copilot_health_warnings
+                _copilot_health_warnings.add(warning_key)
+            if first_warning:
+                logger.warning(
+                    "Copilot exchange state=%s token_type=%s; using the direct token route. "
+                    "An exchangeable ghu_* credential is required for the exchanged route.",
+                    exchange_state,
+                    exchange_health.get("token_type"),
+                )
         pconfig = PROVIDER_REGISTRY.get(seed.provider)
         seed.upsert(source_name, {
             "auth_type": AUTH_TYPE_API_KEY,
@@ -2428,6 +2444,13 @@ def _seed_copilot_singleton(seed: _Seeder) -> None:
             "base_url": enterprise_base_url or (pconfig.inference_base_url if pconfig else ""),
             "label": source,
             "copilot_exchange_degraded": api_token == token and not enterprise_base_url,
+            "copilot_exchange_state": exchange_state,
+            "copilot_exchange_failure_class": exchange_health.get("failure_class"),
+            "copilot_exchange_http_status": exchange_health.get("http_status"),
+            "copilot_exchange_retry_after": exchange_health.get("retry_after"),
+            "copilot_exchange_attempts": exchange_health.get("attempts"),
+            "copilot_token_source_type": exchange_health.get("token_type"),
+            "copilot_reauthorization_required": exchange_health.get("reauthorization_required"),
         })
     except Exception as exc:
         logger.debug("Copilot token seed failed: %s", exc)

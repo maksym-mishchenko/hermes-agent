@@ -100,6 +100,21 @@ def _stale_holder(row, now: float) -> bool:
 class SessionMessagesMixin:
     """Message append/replace/rewind, reactions, resume conversations, replay dedupe."""
 
+    def migrate_transcript_for_replay(self, session_id: str) -> Dict[str, Any]:
+        """Durably normalize one legacy transcript before it enters the live agent loop."""
+        def _do(conn):
+            from agent.transcript_repair import migrate_persisted_transcript
+
+            return migrate_persisted_transcript(
+                conn,
+                self.db_path,
+                session_id,
+                encode_content_fn=self._encode_content,
+                decode_content_fn=self._decode_content,
+            )
+
+        return self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
+
     def _bump_conversation_generation(self, conn, session_id: str, end_reason: str) -> None:
         """Advance the peer's conversation generation past a boundary, in the txn that writes it. Only
         ``_RESET_END_REASONS`` count (compression continues one conversation). Never derived from session

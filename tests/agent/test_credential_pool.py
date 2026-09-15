@@ -1525,6 +1525,49 @@ def test_load_pool_gh_cli_suppression_does_not_block_env_tokens(tmp_path, monkey
     assert [e.source for e in pool.entries()] == ["env:GH_TOKEN"]
 
 
+def test_copilot_degraded_exchange_warning_is_emitted_once(tmp_path, monkeypatch, caplog):
+    import agent.credential_pool as credential_pool
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(tmp_path, {"version": 1, "credential_pool": {}})
+    monkeypatch.setattr(
+        "hermes_cli.copilot_auth.resolve_copilot_token",
+        lambda: ("github_pat_fake", "GITHUB_TOKEN"),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.copilot_auth.get_copilot_api_token",
+        lambda token: (token, None),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.copilot_auth.get_copilot_exchange_health",
+        lambda _token: {
+            "state": "raw_compatible_degraded",
+            "token_type": "fine_grained_pat",
+            "attempts": 1,
+            "http_status": 404,
+            "failure_class": "HTTPError",
+            "retry_after": 1234.0,
+            "reauthorization_required": True,
+        },
+    )
+    credential_pool._copilot_health_warnings.clear()
+
+    with caplog.at_level("WARNING", logger="agent.credential_pool"):
+        first = credential_pool.load_pool("copilot")
+        second = credential_pool.load_pool("copilot")
+
+    warnings = [
+        record for record in caplog.records
+        if "Copilot exchange state=" in record.getMessage()
+    ]
+    assert len(warnings) == 1
+    for pool in (first, second):
+        entry, = pool.entries()
+        assert entry.copilot_exchange_state == "raw_compatible_degraded"
+        assert entry.copilot_reauthorization_required is True
+        assert entry.copilot_exchange_http_status == 404
+
+
 def test_load_pool_skips_resolve_when_all_copilot_sources_suppressed(tmp_path, monkeypatch):
     """With every copilot source suppressed, resolve_copilot_token (which
     shells out to ``gh auth token``) must not run at all."""

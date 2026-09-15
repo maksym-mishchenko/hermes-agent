@@ -15,9 +15,11 @@ def _clear_jwt_cache():
     import hermes_cli.copilot_auth as mod
     mod._jwt_cache.clear()
     mod._exchange_failure_cache.clear()
+    mod._exchange_health.clear()
     yield
     mod._jwt_cache.clear()
     mod._exchange_failure_cache.clear()
+    mod._exchange_health.clear()
 
 
 class TestExchangeCopilotToken:
@@ -220,7 +222,7 @@ class TestExchangeFailureFastPath:
     @patch("time.sleep")
     @patch("urllib.request.urlopen")
     def test_negative_cache_skips_network_on_second_call(self, mock_urlopen, mock_sleep):
-        from hermes_cli.copilot_auth import exchange_copilot_token
+        from hermes_cli.copilot_auth import exchange_copilot_token, get_copilot_exchange_health
 
         mock_urlopen.side_effect = self._http_error(403)
         with pytest.raises(ValueError):
@@ -228,6 +230,44 @@ class TestExchangeFailureFastPath:
         with pytest.raises(ValueError, match="recently failed"):
             exchange_copilot_token("gho_rejected")
         assert mock_urlopen.call_count == 1  # second call never hit the network
+        health = get_copilot_exchange_health("gho_rejected")
+        assert health["state"] == "raw_compatible_degraded"
+        assert health["token_type"] == "github_app_oauth"
+        assert health["attempts"] == 1
+        assert health["http_status"] == 403
+        assert health["failure_class"] == "HTTPError"
+        assert health["cache_source"] == "negative"
+        assert health["retry_after"] > time.time()
+        assert health["reauthorization_required"] is True
+
+    @patch("time.sleep")
+    @patch("urllib.request.urlopen")
+    def test_invalid_success_payload_is_degraded_and_negative_cached(
+        self, mock_urlopen, mock_sleep
+    ):
+        from hermes_cli.copilot_auth import (
+            exchange_copilot_token,
+            get_copilot_exchange_health,
+        )
+
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps(
+            {"token": "", "expires_at": time.time() + 1800}
+        ).encode()
+        mock_response.__enter__ = MagicMock(return_value=mock_response)
+        mock_response.__exit__ = MagicMock(return_value=False)
+        mock_urlopen.return_value = mock_response
+        with pytest.raises(ValueError, match="empty token"):
+            exchange_copilot_token("ghu_invalid")
+        with pytest.raises(ValueError, match="recently failed"):
+            exchange_copilot_token("ghu_invalid")
+
+        assert mock_urlopen.call_count == 3
+        health = get_copilot_exchange_health("ghu_invalid")
+        assert health["state"] == "raw_compatible_degraded"
+        assert health["failure_class"] == "ValueError"
+        assert health["cache_source"] == "negative"
+        assert health["reauthorization_required"] is False
 
     @patch("time.sleep")
     @patch("urllib.request.urlopen")
@@ -266,6 +306,11 @@ class TestExchangeFailureFastPath:
         api_token, _, _ = exchange_copilot_token("gho_recovering")
         assert api_token == "tid=ok;exp=1"
         assert fp not in mod._exchange_failure_cache
+        health = mod.get_copilot_exchange_health("gho_recovering")
+        assert health["state"] == "exchanged"
+        assert health["cache_source"] == "network"
+        assert health["attempts"] == 1
+        assert health["reauthorization_required"] is False
 
     def test_evict_clears_negative_cache(self):
         import hermes_cli.copilot_auth as mod

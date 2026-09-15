@@ -17,8 +17,12 @@ handed to a flush.
 
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from hermes_state import SessionDB
 from agent.context_compressor import _DB_PERSISTED_MARKER as _DB_PERSISTED_MARKER_KEY
@@ -217,3 +221,97 @@ def test_loaded_argument_repair_is_durable_and_one_shot(tmp_path: Path) -> None:
     reloaded = db.get_messages_as_conversation("REPAIR")
     assert reloaded[0]["tool_calls"][0]["function"]["arguments"] == "{}"
     assert sanitize_tool_call_arguments(reloaded, session_id="REPAIR") == 0
+
+
+def test_legacy_transcript_migration_is_durable_and_idempotent(tmp_path: Path) -> None:
+    from agent.agent_runtime_helpers import repair_empty_non_final_messages, sanitize_tool_call_arguments
+
+    db_path = tmp_path / "state.db"
+    db = SessionDB(db_path=db_path)
+    db.create_session("MIGRATE", source="telegram")
+    db.append_message("MIGRATE", "user", "")
+    db.append_message(
+        "MIGRATE",
+        "assistant",
+        "",
+        tool_calls=[
+            {"id": "duplicate", "function": {"name": "terminal", "arguments": '{"command":'}},
+            {"id": "duplicate", "function": {"name": "todo_list", "arguments": "{}"}},
+            {
+                "id": "fc_123",
+                "call_id": "call_ABC",
+                "response_item_id": "fc_123",
+                "function": {"name": "todo_list", "arguments": "{}"},
+            },
+        ],
+    )
+    db.append_message("MIGRATE", "tool", "codex result", tool_call_id="fc_123")
+    db.append_message("MIGRATE", "tool", "first result", tool_call_id="duplicate")
+    db.append_message("MIGRATE", "tool", "second result", tool_call_id="duplicate")
+    db.append_message(
+        "MIGRATE",
+        "assistant",
+        "",
+        tool_calls=[{"id": "valid", "function": {"name": "todo_list", "arguments": "{}"}}],
+    )
+    db.append_message("MIGRATE", "tool", "valid result", tool_call_id="valid")
+    db.append_message("MIGRATE", "user", "", api_content="provider-visible content")
+
+    first = db.migrate_transcript_for_replay("MIGRATE")
+    assert first["state"] == "migrated"
+    assert first["empty_rows"] == 1
+    assert first["arguments"] == 1
+    assert first["ids"] == 1
+    assert first["tool_result_rows"] == 1
+    archive = Path(first["archive_path"])
+    assert archive.is_file()
+    assert archive.stat().st_mode & 0o777 == 0o600
+
+    loaded = db.get_messages_as_conversation("MIGRATE", include_row_ids=True)
+    assert loaded[0]["content"] == "[response interrupted]"
+    assert [call["id"] for call in loaded[1]["tool_calls"]] == [
+        "duplicate", "duplicate_d2", "fc_123",
+    ]
+    assert loaded[1]["tool_calls"][2]["call_id"] == "call_ABC"
+    assert loaded[1]["tool_calls"][2]["response_item_id"] == "fc_123"
+    assert loaded[2]["tool_call_id"] == "fc_123"
+    assert [loaded[3]["tool_call_id"], loaded[4]["tool_call_id"]] == ["duplicate", "duplicate_d2"]
+    assert loaded[5]["content"] == ""
+    assert loaded[7]["content"] == ""
+    assert loaded[7]["api_content"] == "provider-visible content"
+    archive_payload = json.loads(archive.read_text(encoding="utf-8"))
+    assert archive_payload["rows"][0]["session_id"] == "MIGRATE"
+    assert "display_metadata" in archive_payload["rows"][0]
+    assert sanitize_tool_call_arguments(loaded, session_id="MIGRATE") == 0
+    assert repair_empty_non_final_messages(loaded) is loaded
+
+    db.close()
+    reopened = SessionDB(db_path=db_path)
+    second = reopened.migrate_transcript_for_replay("MIGRATE")
+    third = reopened.migrate_transcript_for_replay("MIGRATE")
+    assert second == third == {"state": "already_current", "rows_updated": 0}
+    assert len(list(archive.parent.glob("*.json"))) == 1
+    reloaded = reopened.get_messages_as_conversation("MIGRATE")
+    assert repair_empty_non_final_messages(reloaded) is reloaded
+
+
+def test_transcript_migration_backup_failure_rolls_back(tmp_path: Path, monkeypatch) -> None:
+    import agent.transcript_repair as transcript_repair
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("BACKUP-FAIL", source="telegram")
+    db.append_message("BACKUP-FAIL", "assistant", "")
+
+    def _fail_backup(*_args, **_kwargs):
+        raise OSError("archive unavailable")
+
+    monkeypatch.setattr(transcript_repair, "_write_repair_archive", _fail_backup)
+    with pytest.raises(OSError, match="archive unavailable"):
+        db.migrate_transcript_for_replay("BACKUP-FAIL")
+
+    row = db.get_messages_as_conversation("BACKUP-FAIL")[0]
+    assert row["content"] == ""
+    raw_config = db._conn.execute(
+        "SELECT model_config FROM sessions WHERE id = ?", ("BACKUP-FAIL",)
+    ).fetchone()[0]
+    assert "_transcript_repair_version" not in json.loads(raw_config or "{}")

@@ -488,8 +488,22 @@ class SessionTranscriptMixin:
             db = self._db_for_session_id(session_id)
             session_id = db.get_compression_tip(session_id) or session_id
         try:
+            db = self._db_for_session_id(session_id)
+            migration = db.migrate_transcript_for_replay(session_id)
+            if migration.get("state") == "migrated":
+                logger.warning(
+                    "Durably repaired legacy transcript for session %s: rows=%d empty=%d "
+                    "tool_call_rows=%d tool_result_rows=%d arguments=%d ids=%d",
+                    session_id,
+                    migration["rows_updated"],
+                    migration["empty_rows"],
+                    migration["tool_call_rows"],
+                    migration["tool_result_rows"],
+                    migration["arguments"],
+                    migration["ids"],
+                )
             # repair_alternation: this feeds LIVE REPLAY; heal a durable user;user wedge once here.
-            return self._db_for_session_id(session_id).get_messages_as_conversation(
+            return db.get_messages_as_conversation(
                 session_id, repair_alternation=True, include_row_ids=True)
         except Exception as e:
             # Empty history is valid data; a failed canonical read is not — live-replay callers

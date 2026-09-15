@@ -7,6 +7,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -221,6 +222,7 @@ _JWT_DISK_MAX_BYTES = 1_048_576  # 1 MiB cap on the persisted JWT store read
 # it). Without it a permanently-rejected token burned ~4.5s of retry backoff on EVERY
 # provider-discovery pass (/model picker, delegation spawns, dashboard).
 _exchange_failure_cache: dict[str, float] = {}
+_exchange_health: dict[str, dict[str, object]] = {}
 # Single-flight per fingerprint: concurrent callers (dashboard polls every few seconds) wait on
 # the ONE in-flight exchange instead of each spawning a hung resolver thread during a DNS outage.
 _exchange_locks: dict[str, threading.Lock] = {}
@@ -244,6 +246,52 @@ _EXCHANGE_PERMANENT_HTTP_STATUSES = frozenset({401, 403, 404})
 def _token_fingerprint(raw_token: str) -> str:
     """Short fingerprint of a raw token for cache keying (avoids storing full token)."""
     return hashlib.sha256(raw_token.encode()).hexdigest()[:16]
+
+
+def _token_type(raw_token: str) -> str:
+    """Classify a token without retaining or exposing its value."""
+    for prefix, label in (
+        ("ghu_", "github_user_oauth"),
+        ("github_pat_", "fine_grained_pat"),
+        ("gho_", "github_app_oauth"),
+        ("ghp_", "classic_pat"),
+    ):
+        if raw_token.startswith(prefix):
+            return label
+    return "opaque"
+
+
+def _set_exchange_health(raw_token: str, **values: object) -> dict[str, object]:
+    fp = _token_fingerprint(raw_token)
+    health = {
+        "state": "unknown",
+        "token_type": _token_type(raw_token),
+        "attempts": 0,
+        "http_status": None,
+        "failure_class": None,
+        "cache_source": None,
+        "retry_after": None,
+        "expires_at": None,
+        "reauthorization_required": False,
+        **values,
+    }
+    _exchange_health[fp] = health
+    return dict(health)
+
+
+def get_copilot_exchange_health(raw_token: str) -> dict[str, object]:
+    """Metadata-only exchange state for diagnostics and credential routing."""
+    return dict(_exchange_health.get(_token_fingerprint(raw_token), {
+        "state": "unknown",
+        "token_type": _token_type(raw_token),
+        "attempts": 0,
+        "http_status": None,
+        "failure_class": None,
+        "cache_source": None,
+        "retry_after": None,
+        "expires_at": None,
+        "reauthorization_required": False,
+    }))
 
 
 def _read_jwt_store(path: Path) -> Optional[dict]:
@@ -386,7 +434,27 @@ def _fetch_exchange_with_retry(req, timeout: float, fp: str) -> dict:
         try:
             with _urlopen_bounded(req, timeout) as resp:
                 data = json.loads(resp.read().decode())
+            if not isinstance(data, dict):
+                raise ValueError("Copilot token exchange returned a non-object payload")
+            api_token = data.get("token")
+            if not isinstance(api_token, str) or not api_token.strip():
+                raise ValueError("Copilot token exchange returned an empty token")
+            raw_expiry = data.get("expires_at")
+            if raw_expiry not in (None, "", 0):
+                expires_at = float(raw_expiry)
+                if not math.isfinite(expires_at) or expires_at <= time.time():
+                    raise ValueError("Copilot token exchange returned an invalid expiry")
             _exchange_failure_cache.pop(fp, None)
+            _exchange_health[fp] = {
+                **_exchange_health.get(fp, {}),
+                "state": "exchanged",
+                "attempts": attempt,
+                "http_status": getattr(resp, "status", 200),
+                "failure_class": None,
+                "cache_source": "network",
+                "retry_after": None,
+                "reauthorization_required": False,
+            }
             return data
         except Exception as exc:  # noqa: BLE001 — retry all, re-raise below
             last_exc = exc
@@ -403,6 +471,17 @@ def _fetch_exchange_with_retry(req, timeout: float, fp: str) -> dict:
     _exchange_failure_cache[fp] = time.time() + (
         _EXCHANGE_FAILURE_TTL_PERMANENT_SECONDS if permanent_failure
         else _EXCHANGE_FAILURE_TTL_TRANSIENT_SECONDS)
+    status = getattr(last_exc, "code", None) or getattr(last_exc, "status", None)
+    _exchange_health[fp] = {
+        **_exchange_health.get(fp, {}),
+        "state": "raw_compatible_degraded",
+        "attempts": 1 if permanent_failure else _EXCHANGE_MAX_ATTEMPTS,
+        "http_status": status,
+        "failure_class": type(last_exc).__name__ if last_exc is not None else "unknown",
+        "cache_source": "network",
+        "retry_after": _exchange_failure_cache[fp],
+        "reauthorization_required": permanent_failure,
+    }
     raise ValueError(f"Copilot token exchange failed after {_EXCHANGE_MAX_ATTEMPTS} attempts: "
                      f"{last_exc}") from last_exc
 
@@ -421,14 +500,26 @@ def exchange_copilot_token(
     so it is None. Cached in-process until close to expiry. Raises ``ValueError`` on failure.
     """
     fp = _token_fingerprint(raw_token)
+    if fp not in _exchange_health:
+        _set_exchange_health(raw_token)
     # Fast paths outside the lock: a valid in-process JWT needs no exchange, and a recent failure
     # means queueing behind the in-flight holder (up to ~50 s) would only park an executor thread
     # to learn the same answer.
     cached = _jwt_cache.get(fp)
     if _cache_entry_fresh(cached):
+        _set_exchange_health(
+            raw_token, state="exchanged", cache_source="memory",
+            expires_at=cached[1],
+        )
         return cached
     _fail_until = _exchange_failure_cache.get(fp, 0.0)
     if time.time() < _fail_until:
+        current = _exchange_health.get(fp, {})
+        _exchange_health[fp] = {
+            **current,
+            "cache_source": "negative",
+            "retry_after": _fail_until,
+        }
         raise ValueError("Copilot token exchange recently failed; skipping re-attempt "
                          f"for another {int(_fail_until - time.time())}s")
     # Note: a waiter's own ``timeout`` is not honoured across the lock wait — by design of
@@ -446,6 +537,11 @@ def _exchange_copilot_token_locked(
         cached = lookup(fp)
         if _cache_entry_fresh(cached):
             _jwt_cache[fp] = cached
+            _set_exchange_health(
+                raw_token, state="exchanged",
+                cache_source="memory" if lookup == _jwt_cache.get else "disk",
+                expires_at=cached[1],
+            )
             return cached
     # Negative cache: fail fast so provider discovery / picker opens don't block.
     _fail_until = _exchange_failure_cache.get(fp, 0.0)
@@ -457,9 +553,7 @@ def _exchange_copilot_token_locked(
         headers={"Authorization": f"token {raw_token}", "User-Agent": _EXCHANGE_USER_AGENT,
                  "Accept": "application/json", "Editor-Version": _EDITOR_VERSION})
     data = _fetch_exchange_with_retry(req, timeout, fp)
-    api_token = data.get("token", "")
-    if not api_token:
-        raise ValueError("Copilot token exchange returned empty token")
+    api_token = data["token"]
     expires_at = float(data.get("expires_at") or 0) or time.time() + 1800
     # ``endpoints.api`` is authoritative (Copilot Enterprise / proxied accounts); else derive from
     # the token's ``proxy-ep``. Individual accounts have neither → None (registry default).
@@ -469,6 +563,12 @@ def _exchange_copilot_token_locked(
     ) or _derive_base_url_from_proxy_ep(api_token)
     _jwt_cache[fp] = (api_token, expires_at, base_url)
     _save_jwt_to_disk(fp, api_token, expires_at, base_url)
+    _set_exchange_health(
+        raw_token, state="exchanged", cache_source="network",
+        expires_at=expires_at,
+        attempts=_exchange_health.get(fp, {}).get("attempts", 1),
+        http_status=200,
+    )
     logger.debug("Copilot token exchanged, expires_at=%s, base_url=%s", expires_at, base_url)
     return api_token, expires_at, base_url
 
