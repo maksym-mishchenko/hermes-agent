@@ -243,6 +243,37 @@ class TestLoadTranscriptReroutes:
             "reads must follow the same reroute chain writes use"
         )
 
+    def test_load_transcript_migrates_poisoned_rows_once(self, tmp_path):
+        from gateway.config import GatewayConfig
+        from gateway.session import SessionStore
+
+        store = SessionStore(sessions_dir=tmp_path / "gw-migration", config=GatewayConfig())
+        db = store._db
+        assert db is not None
+        db.create_session("legacy", "telegram", session_key=PEER["session_key"])
+        db.append_message("legacy", "user", "")
+        db.append_message(
+            "legacy",
+            "assistant",
+            "",
+            tool_calls=[
+                {"id": "same", "function": {"name": "terminal", "arguments": "{}"}},
+                {"id": "same", "function": {"name": "todo_list", "arguments": "{}"}},
+            ],
+        )
+        db.append_message("legacy", "tool", "one", tool_call_id="same")
+        db.append_message("legacy", "tool", "two", tool_call_id="same")
+
+        first = store.load_transcript("legacy")
+        second = store.load_transcript("legacy")
+
+        assert first == second
+        assert first[0]["content"] == "[response interrupted]"
+        assert [call["id"] for call in first[1]["tool_calls"]] == ["same", "same_d2"]
+        assert [first[2]["tool_call_id"], first[3]["tool_call_id"]] == ["same", "same_d2"]
+        archives = list((db.db_path.parent / "transcript-repair-archives").glob("*.json"))
+        assert len(archives) == 1
+
     def test_load_transcript_follows_durable_compression_tip(self, tmp_path):
         from gateway.session import SessionStore
 
